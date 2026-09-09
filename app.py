@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from streamlit_gsheets import GSheetsConnection
 
 META_ESPANA = 522800
@@ -44,30 +44,35 @@ if "modo_revision" not in st.session_state:
 if "ignorar_alerta_cuadre" not in st.session_state:
     st.session_state.ignorar_alerta_cuadre = False
 
-# --- CONFIGURACIÓN EN MEMORIA DE PRESUPUESTOS POR PARTIDAS ---
-# Aquí puedes tener varios conceptos para una sola categoría
+# --- CONFIGURACIÓN EN MEMORIA DE PRESUPUESTOS POR PARTIDAS Y DÍAS DE COBRO ---
 if "presupuestos_items" not in st.session_state:
     st.session_state.presupuestos_items = pd.DataFrame([
-        {"Categoria": "Ocio", "Detalle": "General", "Monto": 3000.0, "Expiracion": None},
-        {"Categoria": "Entretenimiento", "Detalle": "General", "Monto": 298.0, "Expiracion": None},
-        {"Categoria": "Mandado", "Detalle": "General", "Monto": 9000.0, "Expiracion": None},
-        {"Categoria": "Servicios basicos", "Detalle": "General", "Monto": 1500.0, "Expiracion": None},
-        {"Categoria": "Gasolina", "Detalle": "General", "Monto": 2000.0, "Expiracion": None},
-        {"Categoria": "Universidad", "Detalle": "General", "Monto": 3000.0, "Expiracion": None},
-        {"Categoria": "Prestamos o deudas", "Detalle": "Deuda Fija", "Monto": 1300.0, "Expiracion": None},
-        {"Categoria": "Prestamos o deudas", "Detalle": "Préstamo a liquidar", "Monto": 2000.0, "Expiracion": date(2025, 12, 31)},
-        {"Categoria": "Casa", "Detalle": "General", "Monto": 5000.0, "Expiracion": None}
+        {"Categoria": "Ocio", "Detalle": "General", "Monto": 3000.0, "Dia_Pago": None, "Expiracion": None},
+        {"Categoria": "Entretenimiento", "Detalle": "General", "Monto": 298.0, "Dia_Pago": None, "Expiracion": None},
+        {"Categoria": "Mandado", "Detalle": "General", "Monto": 9000.0, "Dia_Pago": None, "Expiracion": None},
+        {"Categoria": "Servicios basicos", "Detalle": "General", "Monto": 1500.0, "Dia_Pago": None, "Expiracion": None},
+        {"Categoria": "Gasolina", "Detalle": "General", "Monto": 2000.0, "Dia_Pago": None, "Expiracion": None},
+        {"Categoria": "Universidad", "Detalle": "Colegiatura", "Monto": 2800.0, "Dia_Pago": 20, "Expiracion": None},
+        {"Categoria": "Prestamos o deudas", "Detalle": "Deuda Fija", "Monto": 1300.0, "Dia_Pago": None, "Expiracion": None},
+        {"Categoria": "Prestamos o deudas", "Detalle": "Préstamo a liquidar", "Monto": 2000.0, "Dia_Pago": None, "Expiracion": date(2025, 12, 31)},
+        {"Categoria": "Casa", "Detalle": "General", "Monto": 5000.0, "Dia_Pago": 1, "Expiracion": None}
     ])
 
-# Función para calcular los límites totales ignorando los montos que ya expiraron
+if "dias_cobro" not in st.session_state:
+    st.session_state.dias_cobro = [15, 30]
+
+# Función para calcular límites totales ignorando montos expirados y preparar semáforo
 def calcular_presupuestos_activos():
     hoy = date.today()
     activos = {}
     expirados = []
+    items_vigentes = []
+    
     for idx, row in st.session_state.presupuestos_items.iterrows():
         cat = row.get("Categoria")
         det = row.get("Detalle", "")
         monto = row.get("Monto", 0.0)
+        dia_pago = row.get("Dia_Pago")
         exp = row.get("Expiracion")
         
         if pd.isna(cat) or cat == "": continue
@@ -92,9 +97,12 @@ def calcular_presupuestos_activos():
                 activos[cat] = 0.0
             activos[cat] += float(monto)
             
-    return activos, expirados
+            dia_limpio = int(dia_pago) if pd.notna(dia_pago) and str(dia_pago).strip() != "" else None
+            items_vigentes.append({"Categoria": cat, "Detalle": det, "Monto": float(monto), "Dia_Pago": dia_limpio})
+            
+    return activos, expirados, items_vigentes
 
-presupuestos_activos, expirados = calcular_presupuestos_activos()
+presupuestos_activos, expirados, items_vigentes = calcular_presupuestos_activos()
 
 # --- SECCIÓN PRINCIPAL: FILTROS INTERACTIVOS ---
 st.subheader("🔍 Selector de Periodos y Acumulados")
@@ -303,7 +311,21 @@ with tab_anual:
 
 with tab_presupuestos:
     st.header("💰 Control de Partidas y Vencimientos")
-    st.markdown("Selecciona una categoría de la barra para desglosar sus montos. Puedes añadir varios montos (ej. dividir deudas) y asignarles fechas de expiración separadas. Si la fecha ya pasó, el sistema ignorará el monto.")
+    
+    col_p1, col_p2 = st.columns([1, 2])
+    with col_p1:
+        st.markdown("**1. Configura tus Días de Cobro:**")
+        st.session_state.dias_cobro = st.multiselect(
+            "¿Qué días del mes recibes tus ingresos?",
+            options=list(range(1, 32)),
+            default=st.session_state.dias_cobro
+        )
+    with col_p2:
+        st.info("💡 **Tip de liquidez:** Al definir tus días de cobro y asignarle fecha a tus pagos fuertes (abajo), el sistema trazará un semáforo para que nunca te quedes corto de dinero antes de la quincena.")
+
+    st.divider()
+
+    st.markdown("**2. Edita tus Partidas:** Selecciona una categoría para desglosar sus montos. Puedes añadir varios montos (ej. dividir deudas) y asignarles fechas de pago/expiración. Si la expiración ya pasó, el sistema ignorará el monto.")
     
     categorias_presupuesto = ["Ocio", "Entretenimiento", "Servicios basicos", "Mandado", "Gasolina", "Universidad", "Prestamos o deudas", "Casa"]
     cat_seleccionada = st.selectbox("📂 Selecciona la Categoría a revisar/editar:", categorias_presupuesto)
@@ -314,10 +336,11 @@ with tab_presupuestos:
     df_cat = st.session_state.presupuestos_items[st.session_state.presupuestos_items["Categoria"] == cat_seleccionada].copy()
     
     df_editado = st.data_editor(
-        df_cat[["Detalle", "Monto", "Expiracion"]],
+        df_cat[["Detalle", "Monto", "Dia_Pago", "Expiracion"]],
         column_config={
             "Detalle": st.column_config.TextColumn("Concepto / Nombre del gasto", required=True),
             "Monto": st.column_config.NumberColumn("Monto ($)", min_value=0.0, format="$%f", step=100.0, required=True),
+            "Dia_Pago": st.column_config.NumberColumn("Día de Pago Fijo (1-31)", min_value=1, max_value=31, step=1),
             "Expiracion": st.column_config.DateColumn("Fecha Expiración (Opcional)")
         },
         use_container_width=True,
@@ -326,7 +349,7 @@ with tab_presupuestos:
     )
     
     # Detectar cambios reales rellenando nulos para que la validación sea exacta
-    df_cat_comp = df_cat[["Detalle", "Monto", "Expiracion"]].fillna("")
+    df_cat_comp = df_cat[["Detalle", "Monto", "Dia_Pago", "Expiracion"]].fillna("")
     df_editado_comp = df_editado.fillna("")
     
     if df_cat_comp.to_dict('records') != df_editado_comp.to_dict('records'):
@@ -337,6 +360,53 @@ with tab_presupuestos:
         else:
             st.session_state.presupuestos_items = temp_df
         st.rerun() # Reinicia automático para actualizar los totales visuales abajo y en Tab 1
+
+    # --- SEMÁFORO DE LIQUIDEZ ---
+    st.divider()
+    st.subheader("🚦 Semáforo de Liquidez (Próximos 30 Días)")
+    st.markdown("Revisa el flujo de efectivo del próximo mes. Las **alertas rojas** indican un pago que se debe realizar antes de tu próximo ingreso.")
+    
+    hoy = date.today()
+    eventos_radar = []
+    cobro_detectado = False
+    
+    for i in range(31):
+        dia_evaluar = hoy + timedelta(days=i)
+        
+        # ¿Es día de cobro?
+        if dia_evaluar.day in st.session_state.dias_cobro:
+            eventos_radar.append({"Fecha": dia_evaluar, "Evento": "💰 DÍA DE PAGO", "Monto": "-", "Estado": "🟢 INGRESO"})
+            cobro_detectado = True
+            
+        # Revisar pagos obligatorios de ese día
+        for item in items_vigentes:
+            if item["Dia_Pago"] == dia_evaluar.day:
+                estado_alerta = "🟡 PRÓXIMO" if cobro_detectado or i < 3 else "🔴 ALERTA: SIN LIQUIDEZ PREVIA"
+                if i == 0: estado_alerta = "🚨 ¡PAGO HOY!"
+                
+                eventos_radar.append({
+                    "Fecha": dia_evaluar,
+                    "Evento": f"📄 Pagar: {item['Categoria']} ({item['Detalle']})",
+                    "Monto": f"${item['Monto']:,.2f}",
+                    "Estado": estado_alerta
+                })
+                
+    if eventos_radar:
+        df_radar = pd.DataFrame(eventos_radar)
+        df_radar["Fecha"] = pd.to_datetime(df_radar["Fecha"]).dt.strftime('%d-%b-%Y')
+        
+        def color_estados(val):
+            if isinstance(val, str):
+                if "🔴" in val: return 'background-color: #ffe6e6; color: #990000; font-weight: bold'
+                if "🟢" in val: return 'background-color: #e6ffe6; color: #006600; font-weight: bold'
+                if "🚨" in val: return 'background-color: #ffcccc; color: #cc0000; font-weight: bold'
+                if "🟡" in val: return 'background-color: #ffffe6; color: #b3b300; font-weight: bold'
+            return ''
+        
+        # Usamos .map para ser compatibles con las nuevas versiones de Pandas en Streamlit
+        st.dataframe(df_radar.style.map(color_estados, subset=['Estado']), use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay días de cobro ni pagos fijos programados en los próximos 30 días.")
 
     st.divider()
     st.subheader("📋 Resumen Mensual y Apartado Semanal (Solo Montos Activos)")
