@@ -7,22 +7,22 @@ META_ESPANA = 522800
 
 st.set_page_config(page_title="Proyecto España 2028", page_icon="🇪🇸", layout="wide")
 
-# Conexión usando el ID exacto del documento de Google Sheets
+# Conexión limpia usando los Secrets configurados
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Cargar datos desde la nube apuntando directo al ID y a la pestaña 'registro_financiero'
+# Cargar datos desde la nube usando la configuración de secrets
 try:
-    df = conn.read(spreadsheet="1sY-2_jMkunCpt8ymEX9x-PlgN4HzPaG0T8gj17kl0n0", worksheet="registro_financiero", ttl=600)
+    df = conn.read(worksheet="registro_financiero", ttl=600)
     if df.empty or "ID" not in df.columns:
         df = pd.DataFrame(columns=["Fecha", "Tipo", "Categoria", "Monto", "Descripcion", "ID", "Anio", "Mes"])
 except Exception as e:
     st.error(f"Error al conectar con Google Sheets: {e}")
     df = pd.DataFrame(columns=["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion"])
 
-# Función para guardar en Google Sheets asegurando el ID y la pestaña
+# Función para guardar en Google Sheets
 def guardar_en_nube(df_a_guardar):
     try:
-        conn.update(spreadsheet="1sY-2_jMkunCpt8ymEX9x-PlgN4HzPaG0T8gj17kl0n0", worksheet="registro_financiero", data=df_a_guardar)
+        conn.update(worksheet="registro_financiero", data=df_a_guardar)
         st.cache_data.clear()
         return True, "¡Guardado exitosamente en la nube!"
     except Exception as e:
