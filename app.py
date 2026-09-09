@@ -163,8 +163,32 @@ if alerta_cuadre_activa and not st.session_state.ignorar_alerta_cuadre:
             st.rerun()
     st.divider()
 
+# --- CONFIGURACIÓN DINÁMICA DE PRESUPUESTOS Y VENCIMIENTOS ---
+# Pon "None" si el presupuesto es fijo de por vida. Si es un préstamo, pon la fecha en que acabas de pagarlo ("YYYY-MM-DD")
+presupuestos_config = {
+    "Ocio": {"limite": 3000.0, "expiracion": None},
+    "Entretenimiento": {"limite": 298.0, "expiracion": None},
+    "Mandado": {"limite": 9000.0, "expiracion": None},
+    "Servicios basicos": {"limite": 1500.0, "expiracion": None}, # Ajusta este valor a lo real
+    "Gasolina": {"limite": 2000.0, "expiracion": None},          # Ajusta este valor a lo real
+    "Universidad": {"limite": 3000.0, "expiracion": None},       # Ajusta este valor a lo real
+    "Prestamos o deudas": {"limite": 3300.0, "expiracion": "2025-12-31"}, # Cambia la fecha por la real
+    "Casa": {"limite": 5000.0, "expiracion": None}               # Ajusta este valor a lo real
+}
+
+# Filtrar solo los presupuestos que siguen vigentes el día de hoy
+hoy = date.today()
+presupuestos_activos = {}
+for cat, datos in presupuestos_config.items():
+    if datos["expiracion"]:
+        fecha_exp = datetime.strptime(datos["expiracion"], "%Y-%m-%d").date()
+        if hoy <= fecha_exp:
+            presupuestos_activos[cat] = datos["limite"]
+    else:
+        presupuestos_activos[cat] = datos["limite"]
+
 # --- PESTAÑAS PRINCIPALES ---
-tab_mes, tab_anual, tab_admin = st.tabs(["📊 Resumen de Periodo / Acumulado", "📅 Resumen del Año (Ene - Dic)", "⚙️ Administrar Historial"])
+tab_mes, tab_anual, tab_presupuestos, tab_admin = st.tabs(["📊 Resumen de Periodo", "📅 Resumen del Año", "💰 Presupuestos", "⚙️ Administrar Historial"])
 
 with tab_mes:
     st.header("Resumen del Periodo Seleccionado")
@@ -188,11 +212,11 @@ with tab_mes:
         st.progress(min(fondo_espana_historico / META_ESPANA, 1.0))
 
     if not df_filtrado.empty and "Tipo" in df_filtrado.columns:
-        limites_presupuesto = {"Entretenimiento": 298.0, "Mandado": 9000.0, "Ocio": 3000.0, "Prestamos o deudas": 3300.0}
-        for cat_obj, lim_val in limites_presupuesto.items():
+        # Aquí usamos los presupuestos_activos que calculamos arriba
+        for cat_obj, lim_val in presupuestos_activos.items():
             gasto_act = df_filtrado[(df_filtrado["Tipo"] == "Gasto") & (df_filtrado["Categoria"] == cat_obj)]["Monto"].sum()
             if gasto_act > lim_val:
-                st.warning(f"⚠️ Alerta de Presupuesto: El gasto en **{cat_obj}** (${gasto_act:,.2f}) superó el límite de ${lim_val:,.2f}.")
+                st.warning(f"⚠️ Alerta de Presupuesto: El gasto en **{cat_obj}** (${gasto_act:,.2f}) superó el límite mensual de ${lim_val:,.2f}.")
 
     st.markdown("---")
     st.subheader("📈 Gráficas del Periodo")
@@ -248,6 +272,30 @@ with tab_anual:
                 st.line_chart(tabla_completa.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
             else:
                 st.line_chart(tabla_completa.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
+
+with tab_presupuestos:
+    st.header("💰 Control de Presupuestos y Apartados Semanales")
+    st.markdown("Este es el estimado de lo que debes apartar a la semana (dividido en 4 semanas por mes) para cubrir tus gastos fijos.")
+    
+    if presupuestos_activos:
+        datos_presupuesto = []
+        for cat, limite in presupuestos_activos.items():
+            apartado_semanal = limite / 4
+            datos_presupuesto.append({
+                "Categoría": cat,
+                "Presupuesto Mensual": f"${limite:,.2f}",
+                "Apartado Semanal Sugerido": f"${apartado_semanal:,.2f}"
+            })
+        
+        df_presupuestos_display = pd.DataFrame(datos_presupuesto)
+        st.table(df_presupuestos_display)
+        
+        # Avisar si algún préstamo o presupuesto ya expiró y desapareció del tablero
+        expirados = [cat for cat, datos in presupuestos_config.items() if datos["expiracion"] and datetime.strptime(datos["expiracion"], "%Y-%m-%d").date() < hoy]
+        if expirados:
+            st.info(f"✅ Los siguientes gastos ya se liquidaron (expiraron) y el sistema ya no te pide apartar dinero ni te lanza alertas por ellos: **{', '.join(expirados)}**")
+    else:
+        st.info("No tienes presupuestos activos configurados en este momento.")
 
 with tab_admin:
     st.header("⚙️ Administrar Historial de Movimientos")
