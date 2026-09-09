@@ -8,15 +8,23 @@ from streamlit_gsheets import GSheetsConnection
 # CONFIGURACIÓN GENERAL
 # =============================================================
 META_ESPANA = 522800
+FECHA_META_DEFAULT = date(2028, 12, 31)
 
-# Nombres EXACTOS de las pestañas dentro de tu archivo de Google Sheets
+# Nombres EXACTOS de las pestañas dentro del archivo de Google Sheets
 HOJA_MOVIMIENTOS = "registro_financiero"
 HOJA_PRESUPUESTOS = "presupuestos"
 HOJA_COBROS = "cobros"
+HOJA_COMPROMISOS = "compromisos"
 
-COLS_MOV = ["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion"]
+COLS_MOV = ["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion", "RefID"]
 COLS_PRE = ["ID", "Categoria", "Detalle", "Monto", "Frecuencia", "DiaPago", "Inicio", "Expiracion"]
 COLS_COB = ["ID", "Concepto", "Monto", "Frecuencia", "DiaCobro", "Inicio", "Expiracion"]
+COLS_COMP = ["ID", "Categoria", "Concepto", "MontoProgramado", "FechaProgramada", "Estado",
+             "FechaPago", "MontoPagado", "MovimientoID", "Origen", "Notas"]
+
+ESTADOS = ["Planeado", "Comprometido", "Pagado", "Cancelado"]
+ESTADO_ICONO = {"Planeado": "⚪ Planeado", "Comprometido": "🟡 Comprometido",
+                "Pagado": "🟢 Pagado", "Cancelado": "⚫ Cancelado"}
 
 CATEGORIAS_GASTO = [
     "Ocio", "Entretenimiento", "Servicios basicos", "Mandado",
@@ -46,8 +54,9 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 # =============================================================
 def esqueleto(columnas):
     vacio = pd.DataFrame(columns=columnas)
-    if "Monto" in columnas:
-        vacio["Monto"] = vacio["Monto"].astype(float)
+    for col in ("Monto", "MontoProgramado", "MontoPagado"):
+        if col in columnas:
+            vacio[col] = vacio[col].astype(float)
     return vacio
 
 
@@ -71,14 +80,14 @@ def guardar_hoja(nombre, datos, columnas):
             if col not in limpio.columns:
                 limpio[col] = None
         limpio = limpio[columnas].reset_index(drop=True)
-        for col in ["Inicio", "Expiracion", "Fecha"]:
+        for col in ["Inicio", "Expiracion", "Fecha", "FechaProgramada", "FechaPago"]:
             if col in limpio.columns:
                 fechas = pd.to_datetime(limpio[col], errors="coerce")
                 limpio[col] = fechas.dt.strftime("%Y-%m-%d").fillna("")
         limpio = limpio.fillna("")
         conn.update(worksheet=nombre, data=limpio)
         st.cache_data.clear()
-        return True, f"✅ Guardado en la hoja «{nombre}»."
+        return True, f"✅ Guardado en «{nombre}»."
     except Exception as e:
         return False, f"⚠️ Error al guardar en «{nombre}»: {e}"
 
@@ -93,7 +102,6 @@ def a_numero(serie):
 
 
 def texto_dia(serie):
-    """Los días vienen como '15,30' o 'Sabado'; Sheets a veces los devuelve como 15.0."""
     return (
         serie.fillna("").astype(str)
         .str.replace(r"\.0$", "", regex=True)
@@ -102,18 +110,26 @@ def texto_dia(serie):
     )
 
 
+def texto_simple(serie):
+    return serie.fillna("").astype(str).str.strip().replace({"nan": "", "None": ""})
+
+
 def nuevo_id(offset=0):
     return str(int(pd.Timestamp.now().timestamp() * 1000) + offset)
 
 
 def rellenar_ids(tabla):
-    ids = []
-    for n, valor in enumerate(tabla["ID"]):
-        texto = str(valor).strip()
-        ids.append(texto if texto not in ("", "nan", "None") else nuevo_id(n))
     tabla = tabla.copy()
-    tabla["ID"] = ids
+    tabla["ID"] = [
+        str(v).strip() if str(v).strip() not in ("", "nan", "None") else nuevo_id(n)
+        for n, v in enumerate(tabla["ID"])
+    ]
     return tabla
+
+
+def _a_fecha(valor):
+    f = pd.to_datetime(valor, errors="coerce")
+    return None if pd.isna(f) else f.date()
 
 
 # =============================================================
@@ -138,10 +154,10 @@ def normalizar_movimientos(datos):
     datos["Mes"] = fecha_dt.dt.month.astype(int)
     datos["Periodo_Label"] = fecha_dt.dt.strftime("%Y - %m")
 
-    for col in ["Tipo", "Categoria", "Descripcion"]:
-        datos[col] = datos[col].fillna("").astype(str).str.strip()
+    for col in ["Tipo", "Categoria", "Descripcion", "RefID"]:
+        datos[col] = texto_simple(datos[col])
 
-    datos["ID"] = datos["ID"].astype(str).replace({"nan": "", "None": ""})
+    datos["ID"] = texto_simple(datos["ID"])
     faltantes = datos["ID"] == ""
     if faltantes.any():
         base = int(pd.Timestamp.now().timestamp() * 1000)
@@ -158,14 +174,23 @@ def solo_columnas_mov(datos):
     return limpio[COLS_MOV].reset_index(drop=True)
 
 
+def posibles_duplicados(datos, fecha, tipo, categoria, monto, tolerancia_dias=0):
+    """Movimientos casi idénticos ya registrados."""
+    if datos.empty:
+        return esqueleto(COLS_MOV)
+    objetivo = pd.Timestamp(fecha)
+    cerca = (pd.to_datetime(datos["Fecha"], errors="coerce") - objetivo).abs() <= pd.Timedelta(days=tolerancia_dias)
+    return datos[
+        cerca
+        & (datos["Tipo"] == tipo)
+        & (datos["Categoria"] == categoria)
+        & ((datos["Monto"] - float(monto)).abs() < 0.01)
+    ]
+
+
 # =============================================================
 # MOTOR DE CALENDARIO
 # =============================================================
-def _a_fecha(valor):
-    f = pd.to_datetime(valor, errors="coerce")
-    return None if pd.isna(f) else f.date()
-
-
 def ocurrencias(frecuencia, dia_txt, inicio, expiracion, desde, hasta):
     """Fechas en que aplica una regla dentro del rango [desde, hasta]."""
     freq = str(frecuencia or "Mensual").strip().lower()
@@ -229,47 +254,8 @@ def ocurrencias(frecuencia, dia_txt, inicio, expiracion, desde, hasta):
     return resultado
 
 
-def eventos_en_rango(df_pre, df_cob, desde, hasta):
-    """Une pagos programados y cobros en una sola línea de tiempo ordenada."""
-    eventos = []
-
-    for _, row in df_pre.iterrows():
-        if str(row.get("Detalle") or "").strip() == "":
-            continue
-        monto = float(row.get("Monto") or 0.0)
-        for f in ocurrencias(row.get("Frecuencia"), row.get("DiaPago"), row.get("Inicio"),
-                             row.get("Expiracion"), desde, hasta):
-            eventos.append({
-                "Fecha": f,
-                "Tipo": "Pago",
-                "Concepto": f"{row.get('Categoria', '')} — {row.get('Detalle', '')}".strip(" —"),
-                "Monto": monto,
-            })
-
-    for _, row in df_cob.iterrows():
-        if str(row.get("Concepto") or "").strip() == "":
-            continue
-        monto = float(row.get("Monto") or 0.0)
-        for f in ocurrencias(row.get("Frecuencia"), row.get("DiaCobro"), row.get("Inicio"),
-                             row.get("Expiracion"), desde, hasta):
-            eventos.append({
-                "Fecha": f,
-                "Tipo": "Cobro",
-                "Concepto": str(row.get("Concepto") or ""),
-                "Monto": monto,
-            })
-
-    if not eventos:
-        return pd.DataFrame(columns=["Fecha", "Tipo", "Concepto", "Monto"])
-
-    tabla = pd.DataFrame(eventos)
-    # Si un cobro y un pago caen el mismo día, primero entra el dinero
-    tabla["_orden"] = tabla["Tipo"].map({"Cobro": 0, "Pago": 1})
-    return tabla.sort_values(["Fecha", "_orden", "Concepto"]).drop(columns="_orden").reset_index(drop=True)
-
-
 def equivalente_mensual(df_pre, referencia=None):
-    """Cuánto suma cada categoría dentro del mes calendario de referencia."""
+    """Límite presupuestal de cada categoría dentro del mes calendario de referencia."""
     referencia = referencia or date.today()
     inicio_mes = date(referencia.year, referencia.month, 1)
     fin_mes = date(referencia.year, referencia.month, monthrange(referencia.year, referencia.month)[1])
@@ -292,6 +278,135 @@ def equivalente_mensual(df_pre, referencia=None):
 
 
 # =============================================================
+# COMPROMISOS (flujo de estados)
+# =============================================================
+def normalizar_compromisos(datos):
+    if datos is None or datos.empty:
+        return esqueleto(COLS_COMP)
+    datos = datos.copy()
+    datos["MontoProgramado"] = a_numero(datos["MontoProgramado"])
+    datos["MontoPagado"] = a_numero(datos["MontoPagado"])
+    for col in ["ID", "Categoria", "Concepto", "Estado", "MovimientoID", "Origen", "Notas"]:
+        datos[col] = texto_simple(datos[col])
+    datos["Estado"] = datos["Estado"].replace("", "Planeado")
+    datos.loc[~datos["Estado"].isin(ESTADOS), "Estado"] = "Planeado"
+    for col in ["FechaProgramada", "FechaPago"]:
+        datos[col] = pd.to_datetime(datos[col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    datos = datos[datos["FechaProgramada"] != ""].reset_index(drop=True)
+    return rellenar_ids(datos)
+
+
+def generar_compromisos(df_pre, df_comp, desde, hasta):
+    """Materializa las reglas recurrentes en compromisos concretos, sin duplicar."""
+    existentes = set(zip(df_comp["Origen"].astype(str), df_comp["FechaProgramada"].astype(str)))
+    nuevos, n = [], 0
+
+    for _, row in df_pre.iterrows():
+        regla_id = str(row.get("ID") or "").strip()
+        detalle = str(row.get("Detalle") or "").strip()
+        if regla_id == "" or detalle == "":
+            continue
+        monto = float(row.get("Monto") or 0.0)
+        for f in ocurrencias(row.get("Frecuencia"), row.get("DiaPago"), row.get("Inicio"),
+                             row.get("Expiracion"), desde, hasta):
+            clave = (regla_id, f.strftime("%Y-%m-%d"))
+            if clave in existentes:
+                continue
+            existentes.add(clave)
+            nuevos.append({
+                "ID": nuevo_id(n),
+                "Categoria": row.get("Categoria", ""),
+                "Concepto": detalle,
+                "MontoProgramado": monto,
+                "FechaProgramada": f.strftime("%Y-%m-%d"),
+                "Estado": "Planeado",
+                "FechaPago": "",
+                "MontoPagado": 0.0,
+                "MovimientoID": "",
+                "Origen": regla_id,
+                "Notas": "",
+            })
+            n += 1
+
+    return pd.DataFrame(nuevos, columns=COLS_COMP) if nuevos else esqueleto(COLS_COMP)
+
+
+def marcar_como_pagado(df_mov, df_comp, comp_id, fecha_pago, monto_pagado, nota=""):
+    """Cambia el compromiso a Pagado y crea el movimiento de gasto ligado."""
+    fila = df_comp[df_comp["ID"] == comp_id]
+    if fila.empty:
+        return False, "No se encontró el compromiso."
+    fila = fila.iloc[0]
+
+    mov_id = nuevo_id()
+    nuevo_mov = pd.DataFrame([{
+        "ID": mov_id,
+        "Fecha": fecha_pago.strftime("%Y-%m-%d"),
+        "Anio": int(fecha_pago.year),
+        "Mes": int(fecha_pago.month),
+        "Tipo": "Gasto",
+        "Categoria": fila["Categoria"],
+        "Monto": float(monto_pagado),
+        "Descripcion": f"{fila['Concepto']}{' · ' + nota if nota else ''}",
+        "RefID": comp_id,
+    }])
+
+    ok_mov, msg_mov = guardar_hoja(
+        HOJA_MOVIMIENTOS,
+        pd.concat([solo_columnas_mov(df_mov), nuevo_mov], ignore_index=True),
+        COLS_MOV,
+    )
+    if not ok_mov:
+        return False, msg_mov
+
+    comp_actualizado = df_comp.copy()
+    idx = comp_actualizado["ID"] == comp_id
+    comp_actualizado.loc[idx, "Estado"] = "Pagado"
+    comp_actualizado.loc[idx, "FechaPago"] = fecha_pago.strftime("%Y-%m-%d")
+    comp_actualizado.loc[idx, "MontoPagado"] = float(monto_pagado)
+    comp_actualizado.loc[idx, "MovimientoID"] = mov_id
+    if nota:
+        comp_actualizado.loc[idx, "Notas"] = nota
+
+    ok_comp, msg_comp = guardar_hoja(HOJA_COMPROMISOS, comp_actualizado, COLS_COMP)
+    if not ok_comp:
+        return False, (
+            f"El gasto SÍ se registró (ID {mov_id}) pero el compromiso no se pudo actualizar. "
+            f"Vuelve a intentarlo o corrígelo a mano. {msg_comp}"
+        )
+
+    return True, f"✅ Pago registrado y agregado como gasto (ID {mov_id})."
+
+
+def revertir_pago(df_mov, df_comp, comp_id):
+    """Deshace un pago: borra el movimiento ligado y regresa el compromiso a Comprometido."""
+    fila = df_comp[df_comp["ID"] == comp_id]
+    if fila.empty:
+        return False, "No se encontró el compromiso."
+    mov_id = str(fila.iloc[0]["MovimientoID"]).strip()
+
+    if mov_id:
+        restante = df_mov[df_mov["ID"] != mov_id]
+        ok_mov, msg_mov = guardar_hoja(HOJA_MOVIMIENTOS, solo_columnas_mov(restante), COLS_MOV)
+        if not ok_mov:
+            return False, msg_mov
+
+    comp_actualizado = df_comp.copy()
+    idx = comp_actualizado["ID"] == comp_id
+    comp_actualizado.loc[idx, ["Estado", "FechaPago", "MontoPagado", "MovimientoID"]] = \
+        ["Comprometido", "", 0.0, ""]
+
+    ok_comp, msg_comp = guardar_hoja(HOJA_COMPROMISOS, comp_actualizado, COLS_COMP)
+    return (True, "↩️ Pago revertido.") if ok_comp else (False, msg_comp)
+
+
+def cambiar_estado(df_comp, comp_id, estado):
+    comp_actualizado = df_comp.copy()
+    comp_actualizado.loc[comp_actualizado["ID"] == comp_id, "Estado"] = estado
+    return guardar_hoja(HOJA_COMPROMISOS, comp_actualizado, COLS_COMP)
+
+
+# =============================================================
 # CARGA DE DATOS
 # =============================================================
 st.title("🇪🇸 Tablero Financiero: Proyecto España 2028")
@@ -307,6 +422,7 @@ try:
     df_pre = leer_hoja(HOJA_PRESUPUESTOS, COLS_PRE)
     df_pre["Monto"] = a_numero(df_pre["Monto"])
     df_pre["DiaPago"] = texto_dia(df_pre["DiaPago"])
+    df_pre["ID"] = texto_simple(df_pre["ID"])
 except Exception as e:
     errores.append((HOJA_PRESUPUESTOS, e))
     df_pre = esqueleto(COLS_PRE)
@@ -319,14 +435,32 @@ except Exception as e:
     errores.append((HOJA_COBROS, e))
     df_cob = esqueleto(COLS_COB)
 
+try:
+    df_comp = normalizar_compromisos(leer_hoja(HOJA_COMPROMISOS, COLS_COMP))
+except Exception as e:
+    errores.append((HOJA_COMPROMISOS, e))
+    df_comp = esqueleto(COLS_COMP)
+
 for nombre, err in errores:
     st.error(
-        f"No se pudo leer la pestaña **{nombre}**. Verifica que exista con ese nombre exacto y "
-        f"que el archivo esté compartido como Editor con la cuenta de servicio.\n\n`{err}`"
+        f"No se pudo leer la pestaña **{nombre}**. Verifica que exista con ese nombre exacto "
+        f"y que el archivo esté compartido como Editor con la cuenta de servicio.\n\n`{err}`"
     )
+
+# Chequeo de integridad: pagos marcados sin movimiento real
+if not df_comp.empty and not df.empty:
+    pagados = df_comp[(df_comp["Estado"] == "Pagado") & (df_comp["MovimientoID"] != "")]
+    huerfanos = pagados[~pagados["MovimientoID"].isin(df["ID"])]
+    if not huerfanos.empty:
+        st.warning(
+            f"🔗 {len(huerfanos)} compromiso(s) marcados como Pagado apuntan a un movimiento "
+            f"que ya no existe: {', '.join(huerfanos['Concepto'].head(5))}. "
+            "Reviértelos y vuelve a registrarlos para que el gasto quede contado."
+        )
 
 st.session_state.setdefault("modo_revision", False)
 st.session_state.setdefault("ignorar_alerta_cuadre", False)
+st.session_state.setdefault("confirmar_duplicado", False)
 
 presupuestos_activos, expirados = equivalente_mensual(df_pre)
 
@@ -375,6 +509,7 @@ suma_gastos_ahorro = total_gastos_f + total_ahorro_f
 margen_disponible = total_ingresos_f - suma_gastos_ahorro
 
 alerta_cuadre_activa = total_ingresos_f > 0 and abs(suma_gastos_ahorro - total_ingresos_f) > 1.0
+fondo_espana = float(df.loc[df["Categoria"] == "Fondo España", "Monto"].sum()) if not df.empty else 0.0
 
 
 # =============================================================
@@ -400,11 +535,25 @@ else:
     monto = st.sidebar.number_input("Monto ($)", min_value=0.0, step=100.0, key="monto_mov")
     descripcion = st.sidebar.text_input("Descripción", key="desc_mov")
 
+    duplicados = posibles_duplicados(df, fecha, tipo, categoria, monto) if monto > 0 else esqueleto(COLS_MOV)
+    if not duplicados.empty:
+        st.sidebar.warning(
+            f"🔁 Ya existe un movimiento igual: {duplicados.iloc[0]['Fecha']} · "
+            f"{duplicados.iloc[0]['Categoria']} · ${float(duplicados.iloc[0]['Monto']):,.2f}"
+            + (f" ({duplicados.iloc[0]['Descripcion']})" if duplicados.iloc[0]["Descripcion"] else "")
+        )
+        st.session_state.confirmar_duplicado = st.sidebar.checkbox(
+            "Sí, es otro gasto distinto. Registrarlo igual.", key="chk_dup")
+    else:
+        st.session_state.confirmar_duplicado = False
+
     if st.sidebar.button("Guardar Movimiento", type="primary", use_container_width=True):
         if not (2024 <= fecha.year <= 2035):
             st.sidebar.error("⚠️ El año está fuera del rango válido.")
         elif monto <= 0:
             st.sidebar.error("⚠️ El monto debe ser mayor a 0.")
+        elif not duplicados.empty and not st.session_state.confirmar_duplicado:
+            st.sidebar.error("⚠️ Posible duplicado. Marca la casilla si de verdad quieres registrarlo.")
         else:
             nuevo = pd.DataFrame([{
                 "ID": nuevo_id(),
@@ -415,6 +564,7 @@ else:
                 "Categoria": categoria,
                 "Monto": float(monto),
                 "Descripcion": descripcion,
+                "RefID": "",
             }])
             exito, mensaje = guardar_hoja(
                 HOJA_MOVIMIENTOS,
@@ -424,13 +574,17 @@ else:
             if exito:
                 st.session_state.modo_revision = False
                 st.session_state.ignorar_alerta_cuadre = False
+                st.session_state.confirmar_duplicado = False
                 st.sidebar.success(mensaje)
                 st.rerun()
             else:
                 st.sidebar.error(mensaje)
 
 st.sidebar.divider()
-st.sidebar.caption(f"Movimientos: {len(df)} · Partidas: {len(df_pre)} · Cobros: {len(df_cob)}")
+st.sidebar.caption(
+    f"Movimientos: {len(df)} · Partidas: {len(df_pre)} · "
+    f"Cobros: {len(df_cob)} · Compromisos: {len(df_comp)}"
+)
 
 
 # =============================================================
@@ -459,18 +613,107 @@ if alerta_cuadre_activa and not st.session_state.ignorar_alerta_cuadre:
 
 
 # =============================================================
+# COMPONENTES VISUALES
+# =============================================================
+def barra_presupuesto(nombre, real, limite):
+    pct = 0.0 if limite <= 0 else real / limite
+    if pct < 0.75:
+        color, etiqueta = "#2e9e5b", "En control"
+    elif pct <= 1.0:
+        color, etiqueta = "#e0a106", "Cerca del límite"
+    else:
+        color, etiqueta = "#d1443c", "Excedido"
+    ancho = min(pct, 1.0) * 100
+    st.markdown(
+        f"""
+        <div style="margin-bottom:16px;">
+          <div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;">
+            <span><b>{nombre}</b> <span style="color:#666;">· {etiqueta}</span></span>
+            <span>${real:,.2f} / ${limite:,.2f} <b>({pct*100:.0f}%)</b></span>
+          </div>
+          <div style="background:#e9ecef;border-radius:6px;height:14px;overflow:hidden;">
+            <div style="width:{ancho}%;background:{color};height:100%;"></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def eventos_semaforo(df_pre, df_cob, df_comp, desde, hasta):
+    """Compromisos concretos pendientes + reglas aún no materializadas + cobros."""
+    eventos = []
+    materializados = set()
+
+    if not df_comp.empty:
+        for _, row in df_comp.iterrows():
+            f = _a_fecha(row["FechaProgramada"])
+            if not f:
+                continue
+            origen = str(row.get("Origen") or "").strip()
+            if origen:
+                materializados.add((origen, f))
+            if row["Estado"] in ("Pagado", "Cancelado"):
+                continue
+            if desde <= f <= hasta:
+                eventos.append({
+                    "Fecha": f,
+                    "Tipo": "Pago",
+                    "Concepto": f"{row['Categoria']} — {row['Concepto']}".strip(" —"),
+                    "Monto": float(row["MontoProgramado"]),
+                    "Fuente": row["Estado"],
+                })
+
+    for _, row in df_pre.iterrows():
+        regla_id = str(row.get("ID") or "").strip()
+        detalle = str(row.get("Detalle") or "").strip()
+        if detalle == "":
+            continue
+        monto = float(row.get("Monto") or 0.0)
+        for f in ocurrencias(row.get("Frecuencia"), row.get("DiaPago"), row.get("Inicio"),
+                             row.get("Expiracion"), desde, hasta):
+            if (regla_id, f) in materializados:
+                continue
+            eventos.append({
+                "Fecha": f,
+                "Tipo": "Pago",
+                "Concepto": f"{row.get('Categoria', '')} — {detalle}".strip(" —"),
+                "Monto": monto,
+                "Fuente": "Proyectado",
+            })
+
+    for _, row in df_cob.iterrows():
+        if str(row.get("Concepto") or "").strip() == "":
+            continue
+        monto = float(row.get("Monto") or 0.0)
+        for f in ocurrencias(row.get("Frecuencia"), row.get("DiaCobro"), row.get("Inicio"),
+                             row.get("Expiracion"), desde, hasta):
+            eventos.append({
+                "Fecha": f, "Tipo": "Cobro",
+                "Concepto": str(row.get("Concepto") or ""),
+                "Monto": monto, "Fuente": "Programado",
+            })
+
+    if not eventos:
+        return pd.DataFrame(columns=["Fecha", "Tipo", "Concepto", "Monto", "Fuente"])
+
+    tabla = pd.DataFrame(eventos)
+    tabla["_orden"] = tabla["Tipo"].map({"Cobro": 0, "Pago": 1})
+    return tabla.sort_values(["Fecha", "_orden", "Concepto"]).drop(columns="_orden").reset_index(drop=True)
+
+
+# =============================================================
 # PESTAÑAS
 # =============================================================
-tab_mes, tab_anual, tab_pre, tab_semaforo, tab_admin = st.tabs(
+tab_mes, tab_anual, tab_pre, tab_comp, tab_semaforo, tab_meta, tab_admin = st.tabs(
     ["📊 Resumen de Periodo", "📅 Resumen del Año", "💰 Presupuestos y Calendario",
-     "🚦 Semáforo 30 días", "⚙️ Administrar Historial"]
+     "🧾 Compromisos y Pagos", "🚦 Semáforo", "🎯 Meta España", "⚙️ Administrar Historial"]
 )
 
 with tab_mes:
     st.header("Resumen del periodo seleccionado")
 
     tasa_ahorro = (total_ahorro_f / total_ingresos_f * 100) if total_ingresos_f > 0 else 0.0
-    fondo_espana = float(df.loc[df["Categoria"] == "Fondo España", "Monto"].sum()) if not df.empty else 0.0
     faltante_meta = max(META_ESPANA - fondo_espana, 0.0)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -482,15 +725,48 @@ with tab_mes:
     avance = 0.0 if META_ESPANA <= 0 else min(max(fondo_espana / META_ESPANA, 0.0), 1.0)
     st.progress(avance, text=f"Avance hacia la meta: {avance * 100:.1f}%")
 
-    if not df_filtrado.empty:
-        for cat, lim in presupuestos_activos.items():
-            gasto = float(df_filtrado.loc[
-                (df_filtrado["Tipo"] == "Gasto") & (df_filtrado["Categoria"] == cat), "Monto"].sum())
-            if lim > 0 and gasto > lim:
-                st.warning(
-                    f"⚠️ **{cat}**: llevas ${gasto:,.2f} y tu límite mensual activo es ${lim:,.2f} "
-                    f"(excedente de ${gasto - lim:,.2f})."
-                )
+    # Aviso temprano del semáforo
+    hoy = date.today()
+    linea_corta = eventos_semaforo(df_pre, df_cob, df_comp, hoy, hoy + timedelta(days=15))
+    if not linea_corta.empty:
+        saldo_tmp = margen_disponible
+        for _, ev in linea_corta.iterrows():
+            if ev["Tipo"] == "Cobro":
+                saldo_tmp += ev["Monto"]
+            else:
+                if saldo_tmp < ev["Monto"]:
+                    st.error(
+                        f"🚦 **Ojo en los próximos 15 días**: «{ev['Concepto']}» por "
+                        f"${ev['Monto']:,.2f} el {ev['Fecha'].strftime('%d/%m')} y tu saldo proyectado "
+                        f"sería de ${max(saldo_tmp, 0):,.2f}. Revisa la pestaña Semáforo."
+                    )
+                    break
+                saldo_tmp -= ev["Monto"]
+
+    st.markdown("---")
+    st.subheader("🎯 Presupuesto vs. real por categoría")
+    if not presupuestos_activos:
+        st.info("Configura tus partidas en «Presupuestos y Calendario» para ver este comparativo.")
+    else:
+        gastos_reales = (
+            df_filtrado[df_filtrado["Tipo"] == "Gasto"].groupby("Categoria")["Monto"].sum()
+            if not df_filtrado.empty else pd.Series(dtype=float)
+        )
+        b1, b2 = st.columns(2)
+        for i, (cat, lim) in enumerate(sorted(presupuestos_activos.items())):
+            with (b1 if i % 2 == 0 else b2):
+                barra_presupuesto(cat, float(gastos_reales.get(cat, 0.0)), lim)
+
+        total_lim = sum(presupuestos_activos.values())
+        total_real = float(gastos_reales.sum()) if len(gastos_reales) else 0.0
+        st.caption(
+            f"Total presupuestado del mes: **${total_lim:,.2f}** · "
+            f"Ejercido: **${total_real:,.2f}** · "
+            f"Disponible: **${total_lim - total_real:,.2f}**"
+        )
+        sin_presupuesto = [c for c in gastos_reales.index if c not in presupuestos_activos]
+        if sin_presupuesto:
+            st.warning(f"Gastaste en categorías sin presupuesto asignado: **{', '.join(sin_presupuesto)}**")
 
     st.markdown("---")
     st.subheader("📈 Gráficas del periodo")
@@ -521,14 +797,13 @@ with tab_anual:
     gastos_anio = suma_por_tipo(df_anual, "Gasto")
     ahorro_anio = suma_por_tipo(df_anual, "Ahorro")
     tasa_anio = (ahorro_anio / ingresos_anio * 100) if ingresos_anio > 0 else 0.0
-    fondo_total = float(df.loc[df["Categoria"] == "Fondo España", "Monto"].sum()) if not df.empty else 0.0
 
     a1, a2, a3, a4, a5 = st.columns(5)
     a1.metric("Ingresos anuales", f"${ingresos_anio:,.2f}")
     a2.metric("Gastos anuales", f"${gastos_anio:,.2f}")
     a3.metric("Ahorro anual", f"${ahorro_anio:,.2f}")
     a4.metric("Tasa de ahorro", f"{tasa_anio:.1f}%")
-    a5.metric("Faltante meta", f"${max(META_ESPANA - fondo_total, 0.0):,.2f}")
+    a5.metric("Faltante meta", f"${max(META_ESPANA - fondo_espana, 0.0):,.2f}")
 
     st.markdown("---")
     if df_anual.empty:
@@ -560,19 +835,16 @@ with tab_pre:
     st.header("💰 Presupuestos y calendario")
     st.caption(
         "Frecuencias · **Mensual**: día(s) del mes, ej. `15,30` o `Fin`. "
-        "**Semanal**: nombre del día, ej. `Sabado` o `Lunes,Viernes`. "
-        "**Catorcenal**: cada 14 días contando desde *Inicio*. "
-        "**Unica**: una fecha `AAAA-MM-DD` en la columna del día."
+        "**Semanal**: nombre del día, ej. `Sabado`. "
+        "**Catorcenal**: cada 14 días desde *Inicio*. "
+        "**Unica**: una fecha `AAAA-MM-DD`."
     )
 
     st.subheader("💵 Días de cobro")
     cobros_edit = st.data_editor(
-        df_cob,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
+        df_cob, num_rows="dynamic", use_container_width=True, hide_index=True,
         column_config={
-            "ID": st.column_config.TextColumn("ID", disabled=True, help="Se genera solo al guardar"),
+            "ID": st.column_config.TextColumn("ID", disabled=True),
             "Concepto": st.column_config.TextColumn("Concepto", required=True),
             "Monto": st.column_config.NumberColumn("Monto ($)", min_value=0.0, format="$%.2f", step=100.0),
             "Frecuencia": st.column_config.SelectboxColumn("Frecuencia", options=FRECUENCIAS, required=True),
@@ -598,11 +870,9 @@ with tab_pre:
 
     pre_edit = st.data_editor(
         df_cat[["ID", "Detalle", "Monto", "Frecuencia", "DiaPago", "Inicio", "Expiracion"]],
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
+        num_rows="dynamic", use_container_width=True, hide_index=True,
         column_config={
-            "ID": st.column_config.TextColumn("ID", disabled=True, help="Se genera solo al guardar"),
+            "ID": st.column_config.TextColumn("ID", disabled=True),
             "Detalle": st.column_config.TextColumn("Concepto", required=True),
             "Monto": st.column_config.NumberColumn("Monto ($)", min_value=0.0, format="$%.2f", step=100.0),
             "Frecuencia": st.column_config.SelectboxColumn("Frecuencia", options=FRECUENCIAS, required=True),
@@ -632,7 +902,7 @@ with tab_pre:
     if presupuestos_activos:
         st.dataframe(
             pd.DataFrame([
-                {"Categoría": c, "Total del mes": f"${v:,.2f}", "Apartado semanal (÷4)": f"${v / 4:,.2f}"}
+                {"Categoría": c, "Total del mes": f"${v:,.2f}", "Apartado semanal (÷4)": f"${v/4:,.2f}"}
                 for c, v in sorted(presupuestos_activos.items())
             ]),
             use_container_width=True, hide_index=True,
@@ -640,15 +910,198 @@ with tab_pre:
         total_mensual = sum(presupuestos_activos.values())
         t1, t2 = st.columns(2)
         t1.metric("💰 Presupuesto mensual global", f"${total_mensual:,.2f}")
-        t2.metric("📅 Total semanal a apartar", f"${total_mensual / 4:,.2f}")
+        t2.metric("📅 Total semanal a apartar", f"${total_mensual/4:,.2f}")
     else:
         st.info("No hay partidas activas configuradas para este mes.")
 
     if expirados:
         st.success(f"✅ Ya expiraron y no se cuentan: **{', '.join(sorted(set(expirados)))}**")
 
+with tab_comp:
+    st.header("🧾 Compromisos y pagos")
+    st.caption(
+        "Ciclo: **Planeado** (lo generó el calendario) → **Comprometido** (ya lo confirmaste) → "
+        "**Pagado** (se registra solo como gasto). **Cancelado** lo saca del semáforo sin borrarlo."
+    )
+
+    hoy = date.today()
+    fin_mes = date(hoy.year, hoy.month, monthrange(hoy.year, hoy.month)[1])
+
+    with st.expander("⚙️ Generar compromisos desde el calendario", expanded=df_comp.empty):
+        gc1, gc2, gc3 = st.columns([1, 1, 1])
+        with gc1:
+            gen_desde = st.date_input("Desde", hoy, key="gen_desde")
+        with gc2:
+            gen_hasta = st.date_input("Hasta", fin_mes + timedelta(days=31), key="gen_hasta")
+        with gc3:
+            st.write("")
+            st.write("")
+            if st.button("⚡ Generar", type="primary", use_container_width=True):
+                nuevos = generar_compromisos(df_pre, df_comp, gen_desde, gen_hasta)
+                if nuevos.empty:
+                    st.info("No hay compromisos nuevos que generar en ese rango.")
+                else:
+                    exito, mensaje = guardar_hoja(
+                        HOJA_COMPROMISOS, pd.concat([df_comp, nuevos], ignore_index=True), COLS_COMP)
+                    if exito:
+                        st.success(f"Se generaron {len(nuevos)} compromiso(s).")
+                        st.rerun()
+                    else:
+                        st.error(mensaje)
+
+    pendientes = df_comp[df_comp["Estado"].isin(["Planeado", "Comprometido"])].copy()
+    if not pendientes.empty:
+        pendientes["_f"] = pd.to_datetime(pendientes["FechaProgramada"])
+        pendientes = pendientes.sort_values("_f")
+        vencidos = pendientes[pendientes["_f"].dt.date < hoy]
+        proximos_7 = pendientes[
+            (pendientes["_f"].dt.date >= hoy) & (pendientes["_f"].dt.date <= hoy + timedelta(days=7))]
+    else:
+        vencidos = proximos_7 = esqueleto(COLS_COMP)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Pendientes", len(pendientes))
+    k2.metric("Vencidos", len(vencidos), delta=f"${vencidos['MontoProgramado'].sum():,.2f}" if len(vencidos) else None)
+    k3.metric("Próximos 7 días", len(proximos_7), delta=f"${proximos_7['MontoProgramado'].sum():,.2f}" if len(proximos_7) else None)
+    k4.metric("Pagado este mes", f"${df_comp[(df_comp['Estado']=='Pagado') & (df_comp['FechaPago'].str[:7]==hoy.strftime('%Y-%m'))]['MontoPagado'].sum():,.2f}")
+
+    if len(vencidos):
+        st.error(
+            f"⏰ Tienes {len(vencidos)} compromiso(s) con fecha vencida sin marcar como pagados: "
+            + ", ".join(f"{r['Concepto']} ({r['FechaProgramada']})" for _, r in vencidos.head(4).iterrows())
+        )
+
+    st.divider()
+    st.subheader("✅ Registrar un pago")
+
+    if pendientes.empty:
+        st.info("No hay compromisos pendientes. Genera algunos desde el calendario o agrégalos abajo.")
+    else:
+        opciones = {
+            f"{r['FechaProgramada']} · {r['Categoria']} — {r['Concepto']} · ${float(r['MontoProgramado']):,.2f}": r["ID"]
+            for _, r in pendientes.iterrows()
+        }
+        etiqueta = st.selectbox("Compromiso:", list(opciones.keys()))
+        comp_id = opciones[etiqueta]
+        fila_sel = df_comp[df_comp["ID"] == comp_id].iloc[0]
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            fecha_pago = st.date_input("Fecha real del pago", hoy, key="fp")
+        with p2:
+            monto_pagado = st.number_input(
+                "Monto real pagado ($)", min_value=0.0,
+                value=float(fila_sel["MontoProgramado"]), step=100.0, key="mp")
+        with p3:
+            nota = st.text_input("Nota (opcional)", key="np")
+
+        diferencia = monto_pagado - float(fila_sel["MontoProgramado"])
+        if abs(diferencia) > 0.01:
+            st.warning(
+                f"El monto real difiere del programado en **${diferencia:,.2f}** "
+                f"({'de más' if diferencia > 0 else 'de menos'}). Se registrará el monto real."
+            )
+
+        dup = posibles_duplicados(df, fecha_pago, "Gasto", fila_sel["Categoria"], monto_pagado)
+        dup = dup[dup["RefID"] != comp_id]
+        confirmar = True
+        if not dup.empty:
+            st.warning(
+                f"🔁 Ya hay un gasto igual el {dup.iloc[0]['Fecha']} por ${float(dup.iloc[0]['Monto']):,.2f} "
+                f"en {dup.iloc[0]['Categoria']}. ¿Lo registraste a mano antes?"
+            )
+            confirmar = st.checkbox("Es un pago distinto, regístralo de todas formas.", key="dup_comp")
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button("💸 Marcar como PAGADO", type="primary", use_container_width=True,
+                         disabled=not confirmar):
+                exito, mensaje = marcar_como_pagado(df, df_comp, comp_id, fecha_pago, monto_pagado, nota)
+                if exito:
+                    st.success(mensaje)
+                    st.rerun()
+                else:
+                    st.error(mensaje)
+        with b2:
+            if st.button("🟡 Marcar como Comprometido", use_container_width=True):
+                exito, mensaje = cambiar_estado(df_comp, comp_id, "Comprometido")
+                st.success(mensaje) if exito else st.error(mensaje)
+                if exito:
+                    st.rerun()
+        with b3:
+            if st.button("⚫ Cancelar compromiso", use_container_width=True):
+                exito, mensaje = cambiar_estado(df_comp, comp_id, "Cancelado")
+                st.success(mensaje) if exito else st.error(mensaje)
+                if exito:
+                    st.rerun()
+
+    st.divider()
+    st.subheader("↩️ Deshacer un pago")
+    pagados = df_comp[df_comp["Estado"] == "Pagado"]
+    if pagados.empty:
+        st.caption("Todavía no hay pagos registrados.")
+    else:
+        op_pag = {
+            f"{r['FechaPago']} · {r['Concepto']} · ${float(r['MontoPagado']):,.2f}": r["ID"]
+            for _, r in pagados.sort_values("FechaPago", ascending=False).head(30).iterrows()
+        }
+        etq = st.selectbox("Pago a revertir:", list(op_pag.keys()), key="rev")
+        st.caption("Esto borra el gasto ligado en el registro de movimientos y regresa el compromiso a Comprometido.")
+        if st.button("↩️ Revertir este pago"):
+            exito, mensaje = revertir_pago(df, df_comp, op_pag[etq])
+            if exito:
+                st.success(mensaje)
+                st.rerun()
+            else:
+                st.error(mensaje)
+
+    st.divider()
+    st.subheader("📖 Todos los compromisos")
+    filtro = st.multiselect("Filtrar por estado:", ESTADOS, default=["Planeado", "Comprometido"])
+    vista = df_comp[df_comp["Estado"].isin(filtro)].copy() if filtro else df_comp.copy()
+    if vista.empty:
+        st.caption("Sin compromisos con ese filtro.")
+    else:
+        vista = vista.sort_values("FechaProgramada")
+        vista["Estado"] = vista["Estado"].map(ESTADO_ICONO).fillna(vista["Estado"])
+        st.dataframe(
+            vista[["FechaProgramada", "Categoria", "Concepto", "MontoProgramado",
+                   "Estado", "FechaPago", "MontoPagado", "Notas"]].rename(columns={
+                "FechaProgramada": "Programado", "MontoProgramado": "Monto plan.",
+                "FechaPago": "Pagado el", "MontoPagado": "Monto real"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    with st.expander("➕ Agregar o editar compromisos a mano"):
+        comp_edit = st.data_editor(
+            df_comp, num_rows="dynamic", use_container_width=True, hide_index=True,
+            column_config={
+                "ID": st.column_config.TextColumn("ID", disabled=True),
+                "Categoria": st.column_config.SelectboxColumn("Categoría", options=CATEGORIAS_GASTO),
+                "Concepto": st.column_config.TextColumn("Concepto", required=True),
+                "MontoProgramado": st.column_config.NumberColumn("Monto plan. ($)", format="$%.2f", step=100.0),
+                "FechaProgramada": st.column_config.TextColumn("Programado (AAAA-MM-DD)"),
+                "Estado": st.column_config.SelectboxColumn("Estado", options=ESTADOS),
+                "FechaPago": st.column_config.TextColumn("Pagado el"),
+                "MontoPagado": st.column_config.NumberColumn("Monto real ($)", format="$%.2f"),
+                "MovimientoID": st.column_config.TextColumn("Mov. ligado", disabled=True),
+                "Origen": st.column_config.TextColumn("Regla origen", disabled=True),
+                "Notas": st.column_config.TextColumn("Notas"),
+            },
+            key="editor_comp",
+        )
+        st.caption("Marcar 'Pagado' aquí NO crea el gasto. Usa el botón de arriba para eso.")
+        if st.button("💾 Guardar compromisos"):
+            limpio = comp_edit[comp_edit["Concepto"].astype(str).str.strip() != ""].copy()
+            exito, mensaje = guardar_hoja(HOJA_COMPROMISOS, rellenar_ids(limpio), COLS_COMP)
+            if exito:
+                st.success(mensaje)
+                st.rerun()
+            else:
+                st.error(mensaje)
+
 with tab_semaforo:
-    st.header("🚦 Semáforo de los próximos días")
+    st.header("🚦 Semáforo de flujo")
 
     s1, s2 = st.columns([1, 2])
     with s1:
@@ -656,17 +1109,16 @@ with tab_semaforo:
     with s2:
         saldo_inicial = st.number_input(
             "Saldo disponible hoy ($)",
-            value=float(round(margen_disponible, 2)),
-            step=100.0,
+            value=float(round(margen_disponible, 2)), step=100.0,
             help="Por defecto usa tu margen del periodo (Ingresos − Gastos − Ahorro). "
                  "Ajústalo si el dinero real en tu cuenta es otro.",
         )
 
     hoy = date.today()
-    linea = eventos_en_rango(df_pre, df_cob, hoy, hoy + timedelta(days=dias_vista))
+    linea = eventos_semaforo(df_pre, df_cob, df_comp, hoy, hoy + timedelta(days=dias_vista))
 
     if linea.empty:
-        st.info("No hay cobros ni pagos programados en este rango. Configúralos en «Presupuestos y Calendario».")
+        st.info("No hay cobros ni pagos pendientes en este rango.")
     else:
         saldo = float(saldo_inicial)
         filas, faltante_total, primer_problema = [], 0.0, None
@@ -674,26 +1126,24 @@ with tab_semaforo:
         for _, ev in linea.iterrows():
             if ev["Tipo"] == "Cobro":
                 saldo += ev["Monto"]
-                estado = "💵 ENTRA DINERO"
-                detalle = f"Saldo tras el cobro: ${saldo:,.2f}"
+                estado, detalle = "💵 ENTRA DINERO", f"Saldo tras el cobro: ${saldo:,.2f}"
+            elif saldo >= ev["Monto"]:
+                saldo -= ev["Monto"]
+                estado, detalle = "✅ ALCANZA", f"Te quedan ${saldo:,.2f}"
             else:
-                if saldo >= ev["Monto"]:
-                    saldo -= ev["Monto"]
-                    estado = "✅ ALCANZA"
-                    detalle = f"Te quedan ${saldo:,.2f}"
-                else:
-                    faltan = ev["Monto"] - max(saldo, 0.0)
-                    faltante_total += faltan
-                    if primer_problema is None:
-                        primer_problema = (ev["Fecha"], ev["Concepto"], ev["Monto"], max(saldo, 0.0), faltan)
-                    saldo -= ev["Monto"]
-                    estado = "🔴 NO ALCANZA"
-                    detalle = f"Faltan ${faltan:,.2f} · saldo quedaría en ${saldo:,.2f}"
+                faltan = ev["Monto"] - max(saldo, 0.0)
+                faltante_total += faltan
+                if primer_problema is None:
+                    primer_problema = (ev["Fecha"], ev["Concepto"], ev["Monto"], max(saldo, 0.0), faltan)
+                saldo -= ev["Monto"]
+                estado = "🔴 NO ALCANZA"
+                detalle = f"Faltan ${faltan:,.2f} · saldo quedaría en ${saldo:,.2f}"
 
             filas.append({
                 "Fecha": ev["Fecha"].strftime("%d/%m"),
                 "Día": ABREV_DIA[ev["Fecha"].weekday()],
                 "Movimiento": ev["Concepto"],
+                "Origen": ev["Fuente"],
                 "Monto": ("+" if ev["Tipo"] == "Cobro" else "−") + f"${ev['Monto']:,.2f}",
                 "Estado": estado,
                 "Detalle": detalle,
@@ -702,9 +1152,8 @@ with tab_semaforo:
         if primer_problema:
             f, concepto, monto_p, saldo_p, faltan_p = primer_problema
             st.error(
-                f"⚠️ **Peligro el {f.strftime('%d/%m/%Y')}**: tienes «{concepto}» por **${monto_p:,.2f}** "
-                f"y tu saldo proyectado para esa fecha es de **${saldo_p:,.2f}**. "
-                f"Faltan **${faltan_p:,.2f}**."
+                f"⚠️ **Peligro el {f.strftime('%d/%m/%Y')}**: «{concepto}» por **${monto_p:,.2f}** "
+                f"y tu saldo proyectado sería de **${saldo_p:,.2f}**. Faltan **${faltan_p:,.2f}**."
             )
             if faltante_total > faltan_p + 0.01:
                 st.warning(f"Faltante acumulado en todo el rango: **${faltante_total:,.2f}**.")
@@ -713,26 +1162,119 @@ with tab_semaforo:
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Saldo proyectado al final", f"${saldo:,.2f}")
-        m2.metric("Total a pagar", f"${linea.loc[linea['Tipo'] == 'Pago', 'Monto'].sum():,.2f}")
-        m3.metric("Total a cobrar", f"${linea.loc[linea['Tipo'] == 'Cobro', 'Monto'].sum():,.2f}")
+        m2.metric("Total a pagar", f"${linea.loc[linea['Tipo']=='Pago','Monto'].sum():,.2f}")
+        m3.metric("Total a cobrar", f"${linea.loc[linea['Tipo']=='Cobro','Monto'].sum():,.2f}")
 
         st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+        st.caption("Origen: *Planeado/Comprometido* son compromisos reales; *Proyectado* viene de la regla recurrente.")
+
+with tab_meta:
+    st.header("🎯 Proyección de la meta")
+
+    fecha_objetivo = st.date_input("Fecha objetivo", FECHA_META_DEFAULT)
+    faltante = max(META_ESPANA - fondo_espana, 0.0)
+
+    ahorros = df[df["Tipo"] == "Ahorro"].copy() if not df.empty else esqueleto(COLS_MOV)
+
+    if ahorros.empty:
+        st.info("Registra al menos un movimiento de tipo Ahorro para calcular la proyección.")
+    else:
+        por_mes = ahorros.groupby("Periodo_Label")["Monto"].sum().sort_index()
+
+        hoy = date.today()
+        ultimos = []
+        for i in range(6):
+            mes = hoy.month - i
+            anio = hoy.year
+            while mes <= 0:
+                mes += 12
+                anio -= 1
+            ultimos.append(f"{anio} - {mes:02d}")
+        ritmo_6m = float(sum(por_mes.get(p, 0.0) for p in ultimos) / 6)
+        ritmo_hist = float(por_mes.mean())
+
+        meses_restantes = max(
+            (fecha_objetivo.year - hoy.year) * 12 + (fecha_objetivo.month - hoy.month), 1)
+        requerido = faltante / meses_restantes
+        brecha = requerido - ritmo_6m
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Ahorrado", f"${fondo_espana:,.2f}", delta=f"{fondo_espana/META_ESPANA*100:.1f}% de la meta")
+        r2.metric("Ritmo últimos 6 meses", f"${ritmo_6m:,.2f}/mes",
+                  delta=f"Histórico ${ritmo_hist:,.2f}")
+        r3.metric("Necesario por mes", f"${requerido:,.2f}", delta=f"{meses_restantes} meses restantes")
+        r4.metric("Brecha mensual", f"${abs(brecha):,.2f}",
+                  delta="Vas sobrado" if brecha <= 0 else "Te falta ese extra",
+                  delta_color="normal" if brecha <= 0 else "inverse")
+
+        if ritmo_6m > 0:
+            meses_a_ese_ritmo = faltante / ritmo_6m
+            llegada = hoy + timedelta(days=int(meses_a_ese_ritmo * 30.44))
+            if llegada <= fecha_objetivo:
+                st.success(
+                    f"✅ A tu ritmo actual llegas a los ${META_ESPANA:,.0f} alrededor de "
+                    f"**{MESES_NOMBRES[llegada.month]} {llegada.year}**, "
+                    f"{(fecha_objetivo - llegada).days} días antes del objetivo."
+                )
+            else:
+                st.error(
+                    f"⚠️ A tu ritmo actual llegarías hasta **{MESES_NOMBRES[llegada.month]} {llegada.year}**, "
+                    f"{(llegada - fecha_objetivo).days} días tarde. Necesitas subir el ahorro "
+                    f"**${brecha:,.2f} al mes** para cumplir en la fecha objetivo."
+                )
+        else:
+            st.error("Tu ritmo de ahorro de los últimos 6 meses es cero. La meta no avanza.")
+
+        st.markdown("---")
+        st.subheader("Trayectoria proyectada")
+
+        etiquetas, real_linea, ritmo_linea, req_linea = [], [], [], []
+        acumulado = 0.0
+        for p in por_mes.index:
+            acumulado += float(por_mes[p])
+            anio, mes = p.split(" - ")
+            etiquetas.append(f"{MESES_NOMBRES[int(mes)][:3]} {anio[2:]}")
+            real_linea.append(acumulado)
+            ritmo_linea.append(None)
+            req_linea.append(None)
+
+        base = acumulado
+        cursor = hoy
+        for i in range(1, meses_restantes + 1):
+            mes = cursor.month + i
+            anio = cursor.year + (mes - 1) // 12
+            mes = (mes - 1) % 12 + 1
+            etiquetas.append(f"{MESES_NOMBRES[mes][:3]} {str(anio)[2:]}")
+            real_linea.append(None)
+            ritmo_linea.append(base + ritmo_6m * i)
+            req_linea.append(base + requerido * i)
+
+        grafica = pd.DataFrame(
+            {"Ahorro real": real_linea, "A tu ritmo": ritmo_linea, "Necesario": req_linea},
+            index=etiquetas,
+        )
+        grafica["Meta"] = META_ESPANA
+        st.line_chart(grafica)
+        st.caption("«A tu ritmo» usa el promedio de los últimos 6 meses. «Necesario» es la línea recta a la meta.")
 
 with tab_admin:
     st.header("⚙️ Administrar historial de movimientos")
     if df.empty:
         st.info("No hay movimientos que administrar.")
     else:
+        ligados = int((df["RefID"] != "").sum())
+        if ligados:
+            st.caption(f"🔗 {ligados} movimiento(s) provienen de un compromiso. "
+                       "Si borras uno aquí, revierte también el compromiso para no descuadrar.")
+
         df_admin = st.data_editor(
-            solo_columnas_mov(df),
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
+            solo_columnas_mov(df), num_rows="dynamic", use_container_width=True, hide_index=True,
             column_config={
                 "ID": st.column_config.TextColumn("ID", disabled=True),
                 "Fecha": st.column_config.TextColumn("Fecha (AAAA-MM-DD)"),
                 "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Gasto", "Ingreso", "Ahorro"]),
                 "Monto": st.column_config.NumberColumn("Monto ($)", format="$%.2f", step=100.0),
+                "RefID": st.column_config.TextColumn("Compromiso", disabled=True),
             },
             key="editor_financiero",
         )
