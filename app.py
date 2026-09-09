@@ -106,6 +106,34 @@ def rellenar_ids(tabla):
     return tabla
 
 
+def _sin_latex(texto):
+    """
+    Streamlit interpreta el texto entre dos '$' como fórmula LaTeX, así que
+    '**$2,800.00** y de **$0.00**' se rompe. Escapando el signo, se muestra tal cual.
+    """
+    return texto.replace("$", "\\$") if isinstance(texto, str) else texto
+
+
+def msg_error(c, texto):
+    c.error(_sin_latex(texto))
+
+
+def msg_warning(c, texto):
+    c.warning(_sin_latex(texto))
+
+
+def msg_success(c, texto):
+    c.success(_sin_latex(texto))
+
+
+def msg_info(c, texto):
+    c.info(_sin_latex(texto))
+
+
+def msg_caption(c, texto):
+    c.caption(_sin_latex(texto))
+
+
 def id_desde_contenido(fila, columnas, posicion):
     """
     ID reproducible para filas que llegaron sin ID desde la hoja.
@@ -699,20 +727,20 @@ except Exception as e:
     df_bit = esqueleto(COLS_BIT)
 
 for nombre, err in errores:
-    st.error(
+    msg_error(st, 
         f"No se pudo leer la pestaña **{nombre}**. Verifica que exista con ese nombre exacto "
         f"y que el archivo esté compartido como Editor con la cuenta de servicio.\n\n`{err}`"
     )
 
 if st.session_state.get("aviso_forzado"):
-    st.warning(
+    msg_warning(st, 
         f"⚠️ El último guardado en «{st.session_state.pop('aviso_forzado')}» se hizo con la "
         "protección de sobrescritura desactivada. Si alguien más estaba editando, sus cambios "
         "se perdieron. Revisa la bitácora."
     )
 
 if st.session_state.get("bitacora_error"):
-    st.warning(
+    msg_warning(st, 
         "⚠️ La última operación se guardó, pero no se pudo escribir en la bitácora: "
         f"`{st.session_state.pop('bitacora_error')}`"
     )
@@ -721,7 +749,7 @@ if not df_comp.empty and not df.empty:
     pagados = df_comp[(df_comp["Estado"] == "Pagado") & (df_comp["MovimientoID"] != "")]
     huerfanos = pagados[~pagados["MovimientoID"].isin(df["ID"])]
     if not huerfanos.empty:
-        st.warning(
+        msg_warning(st, 
             f"🔗 {len(huerfanos)} compromiso(s) marcados como Pagado apuntan a un movimiento "
             f"que ya no existe: {', '.join(huerfanos['Concepto'].head(5))}. "
             "Reviértelos y regístralos de nuevo para que el gasto quede contado."
@@ -757,7 +785,7 @@ if not df.empty:
 
     df_filtrado = df[df["Periodo_Label"].isin(meses_seleccionados)]
 else:
-    st.info("Aún no hay movimientos. Registra el primero desde la barra lateral.")
+    msg_info(st, "Aún no hay movimientos. Registra el primero desde la barra lateral.")
     df_filtrado = esqueleto(COLS_MOV)
     anio_seleccionado = date.today().year
 
@@ -787,7 +815,7 @@ st.sidebar.text_input("👤 ¿Quién está capturando?", key="usuario",
                       placeholder="Tu nombre o iniciales",
                       help="Se guarda en la bitácora junto a cada cambio.")
 if not st.session_state.usuario.strip():
-    st.sidebar.caption("Sin nombre, los cambios quedan como «Sin identificar».")
+    msg_caption(st.sidebar, "Sin nombre, los cambios quedan como «Sin identificar».")
 
 if st.sidebar.button("🔄 Recargar desde Google Sheets", use_container_width=True):
     st.cache_data.clear()
@@ -800,12 +828,12 @@ with st.sidebar.expander("🛠️ Opciones avanzadas"):
              "editó la hoja. Con esto activo, tu versión pisa lo que haya en la nube.",
     )
     if st.session_state.get("forzar_guardado"):
-        st.warning("Protección desactivada. Vuelve a activarla al terminar.")
+        msg_warning(st, "Protección desactivada. Vuelve a activarla al terminar.")
 
 st.sidebar.divider()
 
 if st.session_state.modo_revision:
-    st.sidebar.warning("🔒 **Registro bloqueado**\n\nEstás en modo de revisión del historial.")
+    msg_warning(st.sidebar, "🔒 **Registro bloqueado**\n\nEstás en modo de revisión del historial.")
     if st.sidebar.button("Salir del modo revisión", use_container_width=True):
         st.session_state.modo_revision = False
         st.rerun()
@@ -826,7 +854,7 @@ else:
 
     duplicados = posibles_duplicados(df, fecha, tipo, categoria, monto) if monto > 0 else esqueleto(COLS_MOV)
     if not duplicados.empty:
-        st.sidebar.warning(
+        msg_warning(st.sidebar, 
             f"🔁 Ya existe un movimiento igual: {duplicados.iloc[0]['Fecha']} · "
             f"{duplicados.iloc[0]['Categoria']} · ${float(duplicados.iloc[0]['Monto']):,.2f}"
             + (f" ({duplicados.iloc[0]['Descripcion']})" if duplicados.iloc[0]["Descripcion"] else "")
@@ -838,11 +866,11 @@ else:
 
     if st.sidebar.button("Guardar Movimiento", type="primary", use_container_width=True):
         if not (2024 <= fecha.year <= 2035):
-            st.sidebar.error("⚠️ El año está fuera del rango válido.")
+            msg_error(st.sidebar, "⚠️ El año está fuera del rango válido.")
         elif monto <= 0:
-            st.sidebar.error("⚠️ El monto debe ser mayor a 0.")
+            msg_error(st.sidebar, "⚠️ El monto debe ser mayor a 0.")
         elif not duplicados.empty and not st.session_state.confirmar_duplicado:
-            st.sidebar.error("⚠️ Posible duplicado. Marca la casilla si de verdad quieres registrarlo.")
+            msg_error(st.sidebar, "⚠️ Posible duplicado. Marca la casilla si de verdad quieres registrarlo.")
         else:
             nuevo = pd.DataFrame([{
                 "ID": nuevo_id(), "Fecha": fecha.strftime("%Y-%m-%d"),
@@ -860,13 +888,13 @@ else:
                 st.session_state.modo_revision = False
                 st.session_state.ignorar_alerta_cuadre = False
                 st.session_state.confirmar_duplicado = False
-                st.sidebar.success(mensaje)
+                msg_success(st.sidebar, mensaje)
                 st.rerun()
             else:
-                st.sidebar.error(mensaje)
+                msg_error(st.sidebar, mensaje)
 
 st.sidebar.divider()
-st.sidebar.caption(
+msg_caption(st.sidebar, 
     f"Movimientos: {len(df)} · Partidas: {len(df_pre)} · "
     f"Cobros: {len(df_cob)} · Compromisos: {len(df_comp)} · Bitácora: {len(df_bit)}"
 )
@@ -876,7 +904,7 @@ st.sidebar.caption(
 # ALERTA DE CUADRE
 # =============================================================
 if alerta_cuadre_activa and not st.session_state.ignorar_alerta_cuadre:
-    st.error(
+    msg_error(st, 
         "🚨 **Desajuste financiero en el periodo**\n\n"
         f"Ingresos (**${total_ingresos_f:,.2f}**) vs gastos + ahorros (**${suma_gastos_ahorro:,.2f}**). "
         f"Diferencia: **${margen_disponible:,.2f}**."
@@ -914,7 +942,7 @@ def barra_presupuesto(nombre, real, limite):
         <div style="margin-bottom:16px;">
           <div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;">
             <span><b>{nombre}</b> <span style="color:#666;">· {etiqueta}</span></span>
-            <span>${real:,.2f} / ${limite:,.2f} <b>({pct*100:.0f}%)</b></span>
+            <span>&#36;{real:,.2f} / &#36;{limite:,.2f} <b>({pct*100:.0f}%)</b></span>
           </div>
           <div style="background:#e9ecef;border-radius:6px;height:14px;overflow:hidden;">
             <div style="width:{ancho}%;background:{color};height:100%;"></div>
@@ -1014,7 +1042,7 @@ with tab_mes:
                 saldo_tmp += ev["Monto"]
             else:
                 if saldo_tmp < ev["Monto"]:
-                    st.error(
+                    msg_error(st, 
                         f"🚦 **Ojo en los próximos 15 días**: «{ev['Concepto']}» por "
                         f"${ev['Monto']:,.2f} el {ev['Fecha'].strftime('%d/%m')} y tu saldo "
                         f"proyectado sería de ${max(saldo_tmp, 0):,.2f}. Revisa el Semáforo."
@@ -1025,7 +1053,7 @@ with tab_mes:
     st.markdown("---")
     st.subheader("🎯 Presupuesto vs. real por categoría")
     if not presupuestos_activos:
-        st.info("Configura tus partidas en «Presupuestos y Calendario» para ver este comparativo.")
+        msg_info(st, "Configura tus partidas en «Presupuestos y Calendario» para ver este comparativo.")
     else:
         gastos_reales = (
             df_filtrado[df_filtrado["Tipo"] == "Gasto"].groupby("Categoria")["Monto"].sum()
@@ -1038,25 +1066,25 @@ with tab_mes:
 
         total_lim = sum(presupuestos_activos.values())
         total_real = float(gastos_reales.sum()) if len(gastos_reales) else 0.0
-        st.caption(
+        msg_caption(st, 
             f"Total presupuestado del mes: **${total_lim:,.2f}** · "
             f"Ejercido: **${total_real:,.2f}** · Disponible: **${total_lim - total_real:,.2f}**"
         )
         sin_presupuesto = [c for c in gastos_reales.index if c not in presupuestos_activos]
         if sin_presupuesto:
-            st.warning(f"Gastaste en categorías sin presupuesto asignado: **{', '.join(sin_presupuesto)}**")
+            msg_warning(st, f"Gastaste en categorías sin presupuesto asignado: **{', '.join(sin_presupuesto)}**")
 
     st.markdown("---")
     st.subheader("📈 Gráficas del periodo")
     if df_filtrado.empty:
-        st.info("Selecciona un periodo con movimientos.")
+        msg_info(st, "Selecciona un periodo con movimientos.")
     else:
         g1, g2 = st.columns(2)
         with g1:
             st.markdown("**Gastos por categoría**")
             df_gastos = df_filtrado[df_filtrado["Tipo"] == "Gasto"]
             if df_gastos.empty:
-                st.info("Sin gastos en este periodo.")
+                msg_info(st, "Sin gastos en este periodo.")
             else:
                 st.bar_chart(df_gastos.groupby("Categoria", as_index=False)["Monto"].sum(),
                              x="Categoria", y="Monto")
@@ -1085,7 +1113,7 @@ with tab_anual:
 
     st.markdown("---")
     if df_anual.empty:
-        st.info(f"Sin movimientos en {anio_seleccionado}.")
+        msg_info(st, f"Sin movimientos en {anio_seleccionado}.")
     else:
         modo = st.radio("Visualización:", ["Mes a mes (detalle)", "Acumulado del año"], horizontal=True)
         tabla = df_anual.groupby(["Mes", "Tipo"])["Monto"].sum().unstack(fill_value=0.0).reset_index()
@@ -1111,7 +1139,7 @@ with tab_anual:
 
 with tab_pre:
     st.header("💰 Presupuestos y calendario")
-    st.caption(
+    msg_caption(st, 
         "Frecuencias · **Mensual**: día(s) del mes, ej. `15,30` o `Fin`. "
         "**Semanal**: nombre del día, ej. `Sabado`. "
         "**Catorcenal**: cada 14 días desde *Inicio*. **Unica**: una fecha `AAAA-MM-DD`."
@@ -1137,10 +1165,10 @@ with tab_pre:
                                       antes=df_cob, nota="edición de cobros",
                                       normalizador=normalizar_cobros,)
         if exito:
-            st.success(mensaje)
+            msg_success(st, mensaje)
             st.rerun()
         else:
-            st.error(mensaje)
+            msg_error(st, mensaje)
 
     st.divider()
     st.subheader("📂 Partidas de gasto por categoría")
@@ -1155,7 +1183,7 @@ with tab_pre:
             st.cache_data.clear()
             st.rerun()
 
-    st.caption("Para borrar una partida, selecciona su renglón con la casilla de la "
+    msg_caption(st, "Para borrar una partida, selecciona su renglón con la casilla de la "
                "izquierda, presiona Suprimir y luego guarda.")
     df_cat = df_pre[df_pre["Categoria"] == cat_sel].reset_index(drop=True)
 
@@ -1185,10 +1213,10 @@ with tab_pre:
             antes=df_pre, nota=f"edición de partidas · {cat_sel}",
             normalizador=normalizar_presupuestos,)
         if exito:
-            st.success(mensaje)
+            msg_success(st, mensaje)
             st.rerun()
         else:
-            st.error(mensaje)
+            msg_error(st, mensaje)
 
     st.divider()
     st.subheader("📋 Equivalente mensual activo")
@@ -1205,14 +1233,14 @@ with tab_pre:
         t1.metric("💰 Presupuesto mensual global", f"${total_mensual:,.2f}")
         t2.metric("📅 Total semanal a apartar", f"${total_mensual/4:,.2f}")
     else:
-        st.info("No hay partidas activas configuradas para este mes.")
+        msg_info(st, "No hay partidas activas configuradas para este mes.")
 
     if expirados:
-        st.success(f"✅ Ya expiraron y no se cuentan: **{', '.join(sorted(set(expirados)))}**")
+        msg_success(st, f"✅ Ya expiraron y no se cuentan: **{', '.join(sorted(set(expirados)))}**")
 
 with tab_comp:
     st.header("🧾 Compromisos y pagos")
-    st.caption(
+    msg_caption(st, 
         "Ciclo: **Planeado** → **Comprometido** → **Pagado** (se registra solo como gasto). "
         "**Cancelado** lo saca del semáforo sin borrarlo."
     )
@@ -1232,17 +1260,17 @@ with tab_comp:
             if st.button("⚡ Generar", type="primary", use_container_width=True):
                 nuevos = generar_compromisos(df_pre, df_comp, gen_desde, gen_hasta)
                 if nuevos.empty:
-                    st.info("No hay compromisos nuevos que generar en ese rango.")
+                    msg_info(st, "No hay compromisos nuevos que generar en ese rango.")
                 else:
                     exito, mensaje = guardar_hoja(
                         HOJA_COMPROMISOS, pd.concat([df_comp, nuevos], ignore_index=True),
                         COLS_COMP, antes=df_comp, normalizador=normalizar_compromisos,
                         nota=f"generación automática {gen_desde}→{gen_hasta}")
                     if exito:
-                        st.success(f"Se generaron {len(nuevos)} compromiso(s).")
+                        msg_success(st, f"Se generaron {len(nuevos)} compromiso(s).")
                         st.rerun()
                     else:
-                        st.error(mensaje)
+                        msg_error(st, mensaje)
 
     pendientes = df_comp[df_comp["Estado"].isin(["Planeado", "Comprometido"])].copy()
     if not pendientes.empty:
@@ -1266,7 +1294,7 @@ with tab_comp:
     k4.metric("Pagado este mes", f"${pagado_mes:,.2f}")
 
     if len(vencidos):
-        st.error(
+        msg_error(st, 
             f"⏰ Tienes {len(vencidos)} compromiso(s) vencidos sin marcar como pagados: "
             + ", ".join(f"{r['Concepto']} ({r['FechaProgramada']})" for _, r in vencidos.head(4).iterrows())
         )
@@ -1275,7 +1303,7 @@ with tab_comp:
     st.subheader("✅ Registrar un pago")
 
     if pendientes.empty:
-        st.info("No hay compromisos pendientes. Genera algunos desde el calendario o agrégalos abajo.")
+        msg_info(st, "No hay compromisos pendientes. Genera algunos desde el calendario o agrégalos abajo.")
     else:
         opciones = {
             f"{r['FechaProgramada']} · {r['Categoria']} — {r['Concepto']} · ${float(r['MontoProgramado']):,.2f}": r["ID"]
@@ -1296,75 +1324,67 @@ with tab_comp:
 
         diferencia = monto_pagado - float(fila_sel["MontoProgramado"])
         if abs(diferencia) > 0.01:
-            st.warning(
+            msg_warning(st, 
                 f"El monto real difiere del programado en **${diferencia:,.2f}** "
                 f"({'de más' if diferencia > 0 else 'de menos'}). Se registrará el monto real."
             )
 
-        dup = posibles_duplicados(df, fecha_pago, "Gasto", fila_sel["Categoria"], monto_pagado)
-        dup = dup[dup["RefID"] != comp_id]
-        confirmar = True
-        if not dup.empty:
-            st.warning(
-                f"🔁 Ya hay un gasto igual el {dup.iloc[0]['Fecha']} por "
-                f"${float(dup.iloc[0]['Monto']):,.2f} en {dup.iloc[0]['Categoria']}. "
-                "¿Lo registraste a mano antes?"
-            )
-            confirmar = st.checkbox("Es un pago distinto, regístralo de todas formas.", key="dup_comp")
+        # Sin verificación de duplicados: el gasto que se va a crear lo genera este
+        # mismo pago, así que siempre se parecería a sí mismo. La verificación sigue
+        # activa en la captura manual de la barra lateral, que es donde sí aplica.
 
         b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("💸 Marcar como PAGADO", type="primary", use_container_width=True,
-                         disabled=not confirmar):
+            if st.button("💸 Marcar como PAGADO", type="primary", use_container_width=True):
                 exito, mensaje = marcar_como_pagado(df, df_comp, comp_id, fecha_pago, monto_pagado, nota)
                 if exito:
-                    st.success(mensaje)
+                    msg_success(st, mensaje)
                     st.rerun()
                 else:
-                    st.error(mensaje)
+                    msg_error(st, mensaje)
         with b2:
             if st.button("🟡 Marcar como Comprometido", use_container_width=True):
                 exito, mensaje = cambiar_estado(df_comp, comp_id, "Comprometido")
                 if exito:
-                    st.success(mensaje)
+                    msg_success(st, mensaje)
                     st.rerun()
                 else:
-                    st.error(mensaje)
+                    msg_error(st, mensaje)
         with b3:
             if st.button("⚫ Cancelar compromiso", use_container_width=True):
                 exito, mensaje = cambiar_estado(df_comp, comp_id, "Cancelado")
                 if exito:
-                    st.success(mensaje)
+                    msg_success(st, mensaje)
                     st.rerun()
                 else:
-                    st.error(mensaje)
+                    msg_error(st, mensaje)
 
     st.divider()
     st.subheader("↩️ Deshacer un pago")
     pagados = df_comp[df_comp["Estado"] == "Pagado"]
     if pagados.empty:
-        st.caption("Todavía no hay pagos registrados.")
+        msg_caption(st, "Todavía no hay pagos registrados.")
     else:
         op_pag = {
             f"{r['FechaPago']} · {r['Concepto']} · ${float(r['MontoPagado']):,.2f}": r["ID"]
             for _, r in pagados.sort_values("FechaPago", ascending=False).head(30).iterrows()
         }
         etq = st.selectbox("Pago a revertir:", list(op_pag.keys()), key="rev")
-        st.caption("Borra el gasto ligado y regresa el compromiso a Comprometido. Queda en la bitácora.")
+        msg_caption(st, "Borra el gasto ligado y regresa el compromiso a Comprometido. Queda en la bitácora.")
         if st.button("↩️ Revertir este pago"):
             exito, mensaje = revertir_pago(df, df_comp, op_pag[etq])
             if exito:
-                st.success(mensaje)
+                msg_success(st, mensaje)
                 st.rerun()
             else:
-                st.error(mensaje)
+                msg_error(st, mensaje)
 
     st.divider()
     st.subheader("📖 Todos los compromisos")
     filtro = st.multiselect("Filtrar por estado:", ESTADOS, default=["Planeado", "Comprometido"])
     vista = df_comp[df_comp["Estado"].isin(filtro)].copy() if filtro else df_comp.copy()
     if vista.empty:
-        st.caption("Sin compromisos con ese filtro.")
+        msg_caption(st, "Sin compromisos con ese filtro.")
     else:
         vista = vista.sort_values("FechaProgramada")
         vista["Estado"] = vista["Estado"].map(ESTADO_ICONO).fillna(vista["Estado"])
@@ -1394,35 +1414,66 @@ with tab_comp:
             },
             key="editor_comp",
         )
-        st.caption("Marcar 'Pagado' aquí NO crea el gasto. Usa el botón de arriba para eso.")
+        msg_caption(st, "Marcar 'Pagado' aquí NO crea el gasto. Usa el botón de arriba para eso.")
         if st.button("💾 Guardar compromisos"):
             limpio = comp_edit[comp_edit["Concepto"].astype(str).str.strip() != ""].copy()
             exito, mensaje = guardar_hoja(HOJA_COMPROMISOS, rellenar_ids(limpio), COLS_COMP,
                                           antes=df_comp, nota="edición manual",
                                           normalizador=normalizar_compromisos,)
             if exito:
-                st.success(mensaje)
+                msg_success(st, mensaje)
                 st.rerun()
             else:
-                st.error(mensaje)
+                msg_error(st, mensaje)
 
 with tab_semaforo:
     st.header("🚦 Semáforo de flujo")
+
+    hoy = date.today()
+    etiqueta_mes = hoy.strftime("%Y - %m")
+    mes_curso = df[df["Periodo_Label"] == etiqueta_mes] if not df.empty else esqueleto(COLS_MOV)
+
+    ing_mes = suma_por_tipo(mes_curso, "Ingreso")
+    gas_mes = suma_por_tipo(mes_curso, "Gasto")
+    aho_mes = suma_por_tipo(mes_curso, "Ahorro")
+    saldo_auto = ing_mes - gas_mes - aho_mes
 
     s1, s2 = st.columns([1, 2])
     with s1:
         dias_vista = st.slider("Días a proyectar", 7, 90, 30)
     with s2:
-        saldo_inicial = st.number_input(
-            "Saldo disponible hoy ($)", value=float(round(margen_disponible, 2)), step=100.0,
-            help="Por defecto usa tu margen del periodo (Ingresos − Gastos − Ahorro).",
+        base_saldo = st.radio(
+            "Saldo disponible de hoy:",
+            ["Calcularlo automáticamente", "Escribirlo yo"],
+            horizontal=True,
+            help="El automático toma lo que te queda del mes en curso: "
+                 "ingresos − gastos − ahorro.",
         )
 
-    hoy = date.today()
+    if base_saldo == "Calcularlo automáticamente":
+        saldo_inicial = saldo_auto
+        c_s1, c_s2 = st.columns([1, 2])
+        c_s1.metric(f"Disponible de {MESES_NOMBRES[hoy.month]}", f"${saldo_inicial:,.2f}")
+        with c_s2:
+            st.write("")
+            msg_caption(st, 
+                f"Ingresos ${ing_mes:,.2f} − gastos ${gas_mes:,.2f} − "
+                f"ahorro ${aho_mes:,.2f} = **${saldo_auto:,.2f}**. "
+                "Se calcula sobre el mes en curso, no sobre los periodos que elegiste arriba."
+            )
+        if mes_curso.empty:
+            msg_info(st, f"Todavía no hay movimientos registrados en {MESES_NOMBRES[hoy.month]}, "
+                    "así que el disponible arranca en cero.")
+    else:
+        saldo_inicial = st.number_input(
+            "Saldo disponible hoy ($)", value=float(round(saldo_auto, 2)), step=100.0,
+            help="El dinero real que tienes en la cuenta ahora mismo.",
+        )
+
     linea = eventos_semaforo(df_pre, df_cob, df_comp, hoy, hoy + timedelta(days=dias_vista))
 
     if linea.empty:
-        st.info("No hay cobros ni pagos pendientes en este rango.")
+        msg_info(st, "No hay cobros ni pagos pendientes en este rango.")
     else:
         saldo = float(saldo_inicial)
         filas, faltante_total, primer_problema = [], 0.0, None
@@ -1453,14 +1504,14 @@ with tab_semaforo:
 
         if primer_problema:
             f, concepto, monto_p, saldo_p, faltan_p = primer_problema
-            st.error(
+            msg_error(st, 
                 f"⚠️ **Peligro el {f.strftime('%d/%m/%Y')}**: «{concepto}» por **${monto_p:,.2f}** "
                 f"y tu saldo proyectado sería de **${saldo_p:,.2f}**. Faltan **${faltan_p:,.2f}**."
             )
             if faltante_total > faltan_p + 0.01:
-                st.warning(f"Faltante acumulado en todo el rango: **${faltante_total:,.2f}**.")
+                msg_warning(st, f"Faltante acumulado en todo el rango: **${faltante_total:,.2f}**.")
         else:
-            st.success(f"✅ Todos los pagos de los próximos {dias_vista} días están cubiertos.")
+            msg_success(st, f"✅ Todos los pagos de los próximos {dias_vista} días están cubiertos.")
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Saldo proyectado al final", f"${saldo:,.2f}")
@@ -1468,7 +1519,7 @@ with tab_semaforo:
         m3.metric("Total a cobrar", f"${linea.loc[linea['Tipo']=='Cobro','Monto'].sum():,.2f}")
 
         st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
-        st.caption("Origen: *Planeado/Comprometido* son compromisos reales; *Proyectado* viene de la regla.")
+        msg_caption(st, "Origen: *Planeado/Comprometido* son compromisos reales; *Proyectado* viene de la regla.")
 
 with tab_meta:
     st.header("🎯 Proyección de la meta")
@@ -1478,7 +1529,7 @@ with tab_meta:
     ahorros = df[df["Tipo"] == "Ahorro"].copy() if not df.empty else esqueleto(COLS_MOV)
 
     if ahorros.empty:
-        st.info("Registra al menos un movimiento de tipo Ahorro para calcular la proyección.")
+        msg_info(st, "Registra al menos un movimiento de tipo Ahorro para calcular la proyección.")
     else:
         por_mes = ahorros.groupby("Periodo_Label")["Monto"].sum().sort_index()
         hoy = date.today()
@@ -1511,19 +1562,19 @@ with tab_meta:
         if ritmo_6m > 0:
             llegada = hoy + timedelta(days=int((faltante / ritmo_6m) * 30.44))
             if llegada <= fecha_objetivo:
-                st.success(
+                msg_success(st, 
                     f"✅ A tu ritmo actual llegas a los ${META_ESPANA:,.0f} alrededor de "
                     f"**{MESES_NOMBRES[llegada.month]} {llegada.year}**, "
                     f"{(fecha_objetivo - llegada).days} días antes del objetivo."
                 )
             else:
-                st.error(
+                msg_error(st, 
                     f"⚠️ A tu ritmo actual llegarías hasta **{MESES_NOMBRES[llegada.month]} "
                     f"{llegada.year}**, {(llegada - fecha_objetivo).days} días tarde. Necesitas "
                     f"subir el ahorro **${brecha:,.2f} al mes** para cumplir en la fecha objetivo."
                 )
         else:
-            st.error("Tu ritmo de ahorro de los últimos 6 meses es cero. La meta no avanza.")
+            msg_error(st, "Tu ritmo de ahorro de los últimos 6 meses es cero. La meta no avanza.")
 
         st.markdown("---")
         st.subheader("Trayectoria proyectada")
@@ -1553,14 +1604,14 @@ with tab_meta:
             index=etiquetas)
         grafica["Meta"] = META_ESPANA
         st.line_chart(grafica)
-        st.caption("«A tu ritmo» usa el promedio de los últimos 6 meses. «Necesario» es la recta a la meta.")
+        msg_caption(st, "«A tu ritmo» usa el promedio de los últimos 6 meses. «Necesario» es la recta a la meta.")
 
 with tab_bit:
     st.header("🗂️ Bitácora de cambios")
-    st.caption("Cada alta, cambio, baja, pago y reversión queda registrada con quién y cuándo.")
+    msg_caption(st, "Cada alta, cambio, baja, pago y reversión queda registrada con quién y cuándo.")
 
     if df_bit.empty:
-        st.info("Todavía no hay movimientos registrados en la bitácora.")
+        msg_info(st, "Todavía no hay movimientos registrados en la bitácora.")
     else:
         bit = df_bit.copy()
         bit["_ts"] = pd.to_datetime(bit["Timestamp"], errors="coerce")
@@ -1607,7 +1658,7 @@ with tab_bit:
                   bit["_ts"].max().strftime("%d/%m %H:%M") if len(bit) and pd.notna(bit["_ts"].max()) else "—")
 
         if bit.empty:
-            st.caption("Ningún cambio coincide con esos filtros.")
+            msg_caption(st, "Ningún cambio coincide con esos filtros.")
         else:
             st.dataframe(
                 bit[COLS_BIT].rename(columns={
@@ -1631,11 +1682,11 @@ with tab_bit:
 with tab_admin:
     st.header("⚙️ Administrar historial de movimientos")
     if df.empty:
-        st.info("No hay movimientos que administrar.")
+        msg_info(st, "No hay movimientos que administrar.")
     else:
         ligados = int((df["RefID"] != "").sum())
         if ligados:
-            st.caption(f"🔗 {ligados} movimiento(s) provienen de un compromiso. "
+            msg_caption(st, f"🔗 {ligados} movimiento(s) provienen de un compromiso. "
                        "Si borras uno aquí, revierte también el compromiso para no descuadrar.")
 
         df_admin = st.data_editor(
@@ -1659,10 +1710,10 @@ with tab_admin:
                 if exito:
                     st.session_state.modo_revision = False
                     st.session_state.ignorar_alerta_cuadre = False
-                    st.success(mensaje)
+                    msg_success(st, mensaje)
                     st.rerun()
                 else:
-                    st.error(mensaje)
+                    msg_error(st, mensaje)
         with b2:
             if st.button("🔄 Recargar desde Google Sheets", use_container_width=True):
                 st.cache_data.clear()
