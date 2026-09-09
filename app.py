@@ -7,22 +7,22 @@ META_ESPANA = 522800
 
 st.set_page_config(page_title="Proyecto España 2028", page_icon="🇪🇸", layout="wide")
 
-# Conexión a Google Sheets usando el TOML que ya está corregido
+# Conexión usando el ID exacto del documento de Google Sheets
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Cargar datos desde la nube (con memoria de 10 minutos para que cargue rapidísimo)
+# Cargar datos desde la nube apuntando directo al ID y a la pestaña 'registro_financiero'
 try:
-    df = conn.read(worksheet="registro_financiero", ttl=600)
+    df = conn.read(spreadsheet="1sY-2_jMkunCpt8ymEX9x-PlgN4HzPaG0T8gj17kl0n0", worksheet="registro_financiero", ttl=600)
     if df.empty or "ID" not in df.columns:
         df = pd.DataFrame(columns=["Fecha", "Tipo", "Categoria", "Monto", "Descripcion", "ID", "Anio", "Mes"])
 except Exception as e:
     st.error(f"Error al conectar con Google Sheets: {e}")
     df = pd.DataFrame(columns=["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion"])
 
-# Función para guardar en Google Sheets
+# Función para guardar en Google Sheets asegurando el ID y la pestaña
 def guardar_en_nube(df_a_guardar):
     try:
-        conn.update(worksheet="registro_financiero", data=df_a_guardar)
+        conn.update(spreadsheet="1sY-2_jMkunCpt8ymEX9x-PlgN4HzPaG0T8gj17kl0n0", worksheet="registro_financiero", data=df_a_guardar)
         st.cache_data.clear()
         return True, "¡Guardado exitosamente en la nube!"
     except Exception as e:
@@ -144,13 +144,19 @@ if alerta_cuadre_activa and not st.session_state.ignorar_alerta_cuadre:
         """,
         unsafe_allow_html=True
     )
-    col_al1, col_al2 = st.columns(2)
+    
+    col_al1, col_al2, col_al3 = st.columns(3)
     with col_al1:
         if st.button("📝 Los datos no cuadran porque faltan movimientos por registrar", type="primary", use_container_width=True):
             st.session_state.ignorar_alerta_cuadre = True
             st.session_state.modo_revision = False
             st.rerun()
     with col_al2:
+        if st.button("💡 Faltan gastos por hacer", use_container_width=True):
+            st.session_state.ignorar_alerta_cuadre = True
+            st.session_state.modo_revision = False
+            st.rerun()
+    with col_al3:
         if st.button("🔍 Revisar el historial de movimientos", use_container_width=True):
             st.session_state.modo_revision = True
             st.session_state.ignorar_alerta_cuadre = False
