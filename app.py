@@ -44,18 +44,57 @@ if "modo_revision" not in st.session_state:
 if "ignorar_alerta_cuadre" not in st.session_state:
     st.session_state.ignorar_alerta_cuadre = False
 
-# --- CONFIGURACIÓN EN MEMORIA DE PRESUPUESTOS ---
-if "presupuestos_df" not in st.session_state:
-    st.session_state.presupuestos_df = pd.DataFrame([
-        {"Categoria": "Ocio", "Limite": 3000.0, "Expiracion": None},
-        {"Categoria": "Entretenimiento", "Limite": 298.0, "Expiracion": None},
-        {"Categoria": "Mandado", "Limite": 9000.0, "Expiracion": None},
-        {"Categoria": "Servicios basicos", "Limite": 1500.0, "Expiracion": None},
-        {"Categoria": "Gasolina", "Limite": 2000.0, "Expiracion": None},
-        {"Categoria": "Universidad", "Limite": 3000.0, "Expiracion": None},
-        {"Categoria": "Prestamos o deudas", "Limite": 3300.0, "Expiracion": date(2025, 12, 31)},
-        {"Categoria": "Casa", "Limite": 5000.0, "Expiracion": None}
+# --- CONFIGURACIÓN EN MEMORIA DE PRESUPUESTOS POR PARTIDAS ---
+# Aquí puedes tener varios conceptos para una sola categoría
+if "presupuestos_items" not in st.session_state:
+    st.session_state.presupuestos_items = pd.DataFrame([
+        {"Categoria": "Ocio", "Detalle": "General", "Monto": 3000.0, "Expiracion": None},
+        {"Categoria": "Entretenimiento", "Detalle": "General", "Monto": 298.0, "Expiracion": None},
+        {"Categoria": "Mandado", "Detalle": "General", "Monto": 9000.0, "Expiracion": None},
+        {"Categoria": "Servicios basicos", "Detalle": "General", "Monto": 1500.0, "Expiracion": None},
+        {"Categoria": "Gasolina", "Detalle": "General", "Monto": 2000.0, "Expiracion": None},
+        {"Categoria": "Universidad", "Detalle": "General", "Monto": 3000.0, "Expiracion": None},
+        {"Categoria": "Prestamos o deudas", "Detalle": "Deuda Fija", "Monto": 1300.0, "Expiracion": None},
+        {"Categoria": "Prestamos o deudas", "Detalle": "Préstamo a liquidar", "Monto": 2000.0, "Expiracion": date(2025, 12, 31)},
+        {"Categoria": "Casa", "Detalle": "General", "Monto": 5000.0, "Expiracion": None}
     ])
+
+# Función para calcular los límites totales ignorando los montos que ya expiraron
+def calcular_presupuestos_activos():
+    hoy = date.today()
+    activos = {}
+    expirados = []
+    for idx, row in st.session_state.presupuestos_items.iterrows():
+        cat = row.get("Categoria")
+        det = row.get("Detalle", "")
+        monto = row.get("Monto", 0.0)
+        exp = row.get("Expiracion")
+        
+        if pd.isna(cat) or cat == "": continue
+        if pd.isna(monto): monto = 0.0
+            
+        es_activo = True
+        if pd.notna(exp) and exp != "":
+            if isinstance(exp, str):
+                try:
+                    exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                except:
+                    exp_date = hoy
+            else:
+                exp_date = exp
+                
+            if isinstance(exp_date, date) and hoy > exp_date:
+                es_activo = False
+                expirados.append(f"{cat} ({det})")
+                
+        if es_activo:
+            if cat not in activos:
+                activos[cat] = 0.0
+            activos[cat] += float(monto)
+            
+    return activos, expirados
+
+presupuestos_activos, expirados = calcular_presupuestos_activos()
 
 # --- SECCIÓN PRINCIPAL: FILTROS INTERACTIVOS ---
 st.subheader("🔍 Selector de Periodos y Acumulados")
@@ -176,38 +215,6 @@ if alerta_cuadre_activa and not st.session_state.ignorar_alerta_cuadre:
             st.rerun()
     st.divider()
 
-# --- CALCULAR PRESUPUESTOS ACTIVOS (GLOBALES) ---
-hoy = date.today()
-presupuestos_activos = {}
-expirados = []
-
-for idx, row in st.session_state.presupuestos_df.iterrows():
-    cat = row.get("Categoria")
-    limite = row.get("Limite", 0.0)
-    exp = row.get("Expiracion")
-    
-    if pd.isna(cat) or cat == "":
-        continue
-    if pd.isna(limite):
-        limite = 0.0
-        
-    es_activo = True
-    if pd.notna(exp) and exp is not None:
-        if isinstance(exp, str):
-            try:
-                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-            except:
-                exp_date = hoy
-        else:
-            exp_date = exp
-            
-        if isinstance(exp_date, date) and hoy > exp_date:
-            es_activo = False
-            expirados.append(cat)
-            
-    if es_activo:
-        presupuestos_activos[cat] = float(limite)
-
 # --- PESTAÑAS PRINCIPALES ---
 tab_mes, tab_anual, tab_presupuestos, tab_admin = st.tabs(["📊 Resumen de Periodo", "📅 Resumen del Año", "💰 Presupuestos", "⚙️ Administrar Historial"])
 
@@ -233,11 +240,11 @@ with tab_mes:
         st.progress(min(fondo_espana_historico / META_ESPANA, 1.0))
 
     if not df_filtrado.empty and "Tipo" in df_filtrado.columns:
-        # Aquí usamos los presupuestos dinámicos calculados
+        # Aquí usamos los presupuestos_activos agrupados
         for cat_obj, lim_val in presupuestos_activos.items():
             gasto_act = df_filtrado[(df_filtrado["Tipo"] == "Gasto") & (df_filtrado["Categoria"] == cat_obj)]["Monto"].sum()
             if gasto_act > lim_val:
-                st.warning(f"⚠️ Alerta de Presupuesto: El gasto en **{cat_obj}** (${gasto_act:,.2f}) superó tu límite dinámico de ${lim_val:,.2f}.")
+                st.warning(f"⚠️ Alerta de Presupuesto: El gasto en **{cat_obj}** (${gasto_act:,.2f}) superó tu límite asignado de ${lim_val:,.2f}.")
 
     st.markdown("---")
     st.subheader("📈 Gráficas del Periodo")
@@ -295,43 +302,62 @@ with tab_anual:
                 st.line_chart(tabla_completa.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
 
 with tab_presupuestos:
-    st.header("💰 Control Dinámico de Presupuestos")
-    st.markdown("Haz doble clic en la tabla para modificar los límites mensuales o agregar fechas de expiración. También puedes añadir nuevas categorías dando clic en el botón '+' al final. **Presiona Enter al terminar de editar para aplicar los cambios.**")
+    st.header("💰 Control de Partidas y Vencimientos")
+    st.markdown("Selecciona una categoría de la barra para desglosar sus montos. Puedes añadir varios montos (ej. dividir deudas) y asignarles fechas de expiración separadas. Si la fecha ya pasó, el sistema ignorará el monto.")
     
-    # Editor interactivo que actualiza los presupuestos en tiempo real
-    st.session_state.presupuestos_df = st.data_editor(
-        st.session_state.presupuestos_df,
+    categorias_presupuesto = ["Ocio", "Entretenimiento", "Servicios basicos", "Mandado", "Gasolina", "Universidad", "Prestamos o deudas", "Casa"]
+    cat_seleccionada = st.selectbox("📂 Selecciona la Categoría a revisar/editar:", categorias_presupuesto)
+    
+    st.markdown(f"**Desglose de montos para: {cat_seleccionada}**")
+    
+    # Extraer solo las filas de la categoría seleccionada
+    df_cat = st.session_state.presupuestos_items[st.session_state.presupuestos_items["Categoria"] == cat_seleccionada].copy()
+    
+    df_editado = st.data_editor(
+        df_cat[["Detalle", "Monto", "Expiracion"]],
         column_config={
-            "Categoria": st.column_config.TextColumn("Categoría", required=True),
-            "Limite": st.column_config.NumberColumn("Límite Mensual ($)", min_value=0.0, format="$%f", step=100.0, required=True),
+            "Detalle": st.column_config.TextColumn("Concepto / Nombre del gasto", required=True),
+            "Monto": st.column_config.NumberColumn("Monto ($)", min_value=0.0, format="$%f", step=100.0, required=True),
             "Expiracion": st.column_config.DateColumn("Fecha Expiración (Opcional)")
         },
         use_container_width=True,
         num_rows="dynamic",
-        key="editor_presupuestos"
+        key=f"editor_{cat_seleccionada}"
     )
+    
+    # Detectar cambios reales rellenando nulos para que la validación sea exacta
+    df_cat_comp = df_cat[["Detalle", "Monto", "Expiracion"]].fillna("")
+    df_editado_comp = df_editado.fillna("")
+    
+    if df_cat_comp.to_dict('records') != df_editado_comp.to_dict('records'):
+        temp_df = st.session_state.presupuestos_items[st.session_state.presupuestos_items["Categoria"] != cat_seleccionada].copy()
+        if not df_editado.empty:
+            df_editado["Categoria"] = cat_seleccionada
+            st.session_state.presupuestos_items = pd.concat([temp_df, df_editado], ignore_index=True)
+        else:
+            st.session_state.presupuestos_items = temp_df
+        st.rerun() # Reinicia automático para actualizar los totales visuales abajo y en Tab 1
 
-    # Mostrar cálculo de apartados en base a lo configurado y activo
     st.divider()
-    st.subheader("📋 Resumen de Apartados Sugeridos")
+    st.subheader("📋 Resumen Mensual y Apartado Semanal (Solo Montos Activos)")
     
     if presupuestos_activos:
         datos_mostrar = []
         for cat, lim in presupuestos_activos.items():
             datos_mostrar.append({
                 "Categoría": cat,
-                "Presupuesto Mensual": f"${lim:,.2f}",
+                "Límite Mensual Activo": f"${lim:,.2f}",
                 "Apartado Semanal (x4)": f"${(lim/4):,.2f}"
             })
         st.table(pd.DataFrame(datos_mostrar))
     else:
-        st.info("No tienes presupuestos activos configurados.")
+        st.info("No tienes presupuestos activos configurados en este momento.")
         
     if expirados:
-        st.success(f"✅ Los siguientes gastos expiraron según tus fechas y ya no se contabilizan: **{', '.join(expirados)}**")
+        st.success(f"✅ Los siguientes montos ya expiraron y fueron descontados del cálculo: **{', '.join(expirados)}**")
         
     st.divider()
-    st.markdown("### 📊 Totales Estimados")
+    st.markdown("### 📊 Totales Globales Estimados")
     total_mensual = sum(presupuestos_activos.values())
     total_semanal = total_mensual / 4
     
