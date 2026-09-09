@@ -7,29 +7,29 @@ META_ESPANA = 522800
 
 st.set_page_config(page_title="Proyecto España 2028", page_icon="🇪🇸", layout="wide")
 
-# Conexión a Google Sheets
+# Conexión a Google Sheets especificando la pestaña correcta
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Cargar datos desde la nube
+# Cargar datos desde la nube apuntando a 'registro_financiero'
 try:
-    df = conn.read(ttl=0)
+    df = conn.read(worksheet="registro_financiero", ttl=0)
     if df.empty or "ID" not in df.columns:
         df = pd.DataFrame(columns=["Fecha", "Tipo", "Categoria", "Monto", "Descripcion", "ID", "Anio", "Mes"])
 except Exception as e:
     st.error(f"Error al conectar con Google Sheets: {e}")
     df = pd.DataFrame(columns=["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion"])
 
-# Función para guardar en Google Sheets
+# Función para guardar en Google Sheets en la pestaña correcta
 def guardar_en_nube(df_a_guardar):
     try:
-        conn.update(data=df_a_guardar)
+        conn.update(data=df_a_guardar, worksheet="registro_financiero")
         st.cache_data.clear()
         return True, "¡Guardado exitosamente en la nube!"
     except Exception as e:
         return False, f"⚠️ Error al guardar en Google Sheets: {e}"
 
 # Validar formato de fecha y columnas base
-if not df.empty:
+if not df.empty and "Fecha" in df.columns:
     df["Fecha_DT"] = pd.to_datetime(df["Fecha"], errors="coerce")
     df["Anio"] = df["Fecha_DT"].dt.year.fillna(date.today().year).astype(int)
     df["Mes"] = df["Fecha_DT"].dt.month.fillna(date.today().month).astype(int)
@@ -47,7 +47,7 @@ if "ignorar_alerta_cuadre" not in st.session_state:
 # --- SECCIÓN PRINCIPAL: FILTROS INTERACTIVOS ---
 st.subheader("🔍 Selector de Periodos y Acumulados")
 
-if not df.empty and "Periodo_Label" in df.columns or not df.empty:
+if not df.empty and "Fecha" in df.columns:
     df["Periodo_Label"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime('%Y - %B')
     periodos_disponibles = sorted(df["Periodo_Label"].dropna().unique(), reverse=True)
     mes_actual_label = pd.Timestamp.now().strftime('%Y - %B')
@@ -74,9 +74,9 @@ else:
 
 st.divider()
 
-total_ingresos_f = df_filtrado[df_filtrado["Tipo"] == "Ingreso"]["Monto"].sum() if not df_filtrado.empty else 0.0
-total_gastos_f = df_filtrado[df_filtrado["Tipo"] == "Gasto"]["Monto"].sum() if not df_filtrado.empty else 0.0
-total_ahorro_f = df_filtrado[df_filtrado["Tipo"] == "Ahorro"]["Monto"].sum() if not df_filtrado.empty else 0.0
+total_ingresos_f = df_filtrado[df_filtrado["Tipo"] == "Ingreso"]["Monto"].sum() if not df_filtrado.empty and "Tipo" in df_filtrado.columns else 0.0
+total_gastos_f = df_filtrado[df_filtrado["Tipo"] == "Gasto"]["Monto"].sum() if not df_filtrado.empty and "Tipo" in df_filtrado.columns else 0.0
+total_ahorro_f = df_filtrado[df_filtrado["Tipo"] == "Ahorro"]["Monto"].sum() if not df_filtrado.empty and "Tipo" in df_filtrado.columns else 0.0
 suma_gastos_ahorro = total_gastos_f + total_ahorro_f
 
 alerta_cuadre_activa = False
@@ -169,7 +169,7 @@ with tab_mes:
     margen_libre = total_ingresos - total_gastos
     tasa_ahorro = (total_ahorro_mes / total_ingresos * 100) if total_ingresos > 0 else 0.0
 
-    fondo_espana_historico = df[df["Categoria"] == "Fondo España"]["Monto"].sum() if not df.empty else 0.0
+    fondo_espana_historico = df[df["Categoria"] == "Fondo España"]["Monto"].sum() if not df.empty and "Categoria" in df.columns else 0.0
     faltante_meta = META_ESPANA - fondo_espana_historico
 
     col1, col2, col3, col4 = st.columns(4)
@@ -181,7 +181,7 @@ with tab_mes:
     if META_ESPANA > 0:
         st.progress(min(fondo_espana_historico / META_ESPANA, 1.0))
 
-    if not df_filtrado.empty:
+    if not df_filtrado.empty and "Tipo" in df_filtrado.columns:
         limites_presupuesto = {"Entretenimiento": 298.0, "Mandado": 9000.0, "Ocio": 3000.0, "Prestamos o deudas": 3300.0}
         for cat_obj, lim_val in limites_presupuesto.items():
             gasto_act = df_filtrado[(df_filtrado["Tipo"] == "Gasto") & (df_filtrado["Categoria"] == cat_obj)]["Monto"].sum()
@@ -190,7 +190,7 @@ with tab_mes:
 
     st.markdown("---")
     st.subheader("📈 Gráficas del Periodo")
-    if not df_filtrado.empty:
+    if not df_filtrado.empty and "Tipo" in df_filtrado.columns:
         col_g1, col_g2 = st.columns(2)
         with col_g1:
             st.markdown("**Gastos por Categoría**")
@@ -205,14 +205,14 @@ with tab_mes:
 
 with tab_anual:
     st.header(f"📅 Resumen Anual: {anio_seleccionado} (Enero a Diciembre)")
-    if not df.empty:
+    if not df.empty and "Anio" in df.columns:
         df_anual = df[df["Anio"] == anio_seleccionado]
-        ingresos_anio = df_anual[df_anual["Tipo"] == "Ingreso"]["Monto"].sum()
-        gastos_anio = df_anual[df_anual["Tipo"] == "Gasto"]["Monto"].sum()
-        ahorro_anio = df_anual[df_anual["Tipo"] == "Ahorro"]["Monto"].sum()
+        ingresos_anio = df_anual[df_anual["Tipo"] == "Ingreso"]["Monto"].sum() if "Tipo" in df_anual.columns else 0.0
+        gastos_anio = df_anual[df_anual["Tipo"] == "Gasto"]["Monto"].sum() if "Tipo" in df_anual.columns else 0.0
+        ahorro_anio = df_anual[df_anual["Tipo"] == "Ahorro"]["Monto"].sum() if "Tipo" in df_anual.columns else 0.0
         margen_anio = ingresos_anio - gastos_anio
         tasa_ahorro_anio = (ahorro_anio / ingresos_anio * 100) if ingresos_anio > 0 else 0.0
-        faltante_meta = META_ESPANA - (df[df["Categoria"] == "Fondo España"]["Monto"].sum() if not df.empty else 0.0)
+        faltante_meta = META_ESPANA - (df[df["Categoria"] == "Fondo España"]["Monto"].sum() if "Categoria" in df.columns else 0.0)
         
         col_a1, col_a2, col_a3, col_a4, col_a5 = st.columns(5)
         col_a1.metric("Ingresos Anuales", f"${ingresos_anio:,.2f}")
@@ -225,7 +225,7 @@ with tab_anual:
         modo_visual = st.radio("Modo de visualización anual:", ["Mes a Mes (Detalle)", "Periodo Completo Anual (Acumulado)"], horizontal=True)
         meses_nombres = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
         
-        if not df_anual.empty:
+        if not df_anual.empty and "Mes" in df_anual.columns and "Tipo" in df_anual.columns:
             tabla_mensual = df_anual.groupby(["Mes", "Tipo"])["Monto"].sum().unstack(fill_value=0).reset_index()
             for col in ["Ingreso", "Gasto", "Ahorro"]:
                 if col not in tabla_mensual.columns:
