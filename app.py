@@ -120,7 +120,7 @@ else:
                 "Mes": [int(fecha.month)]
             })
             df_actualizado = pd.concat([df.drop(columns=["Fecha_DT", "Periodo_Label"], errors="ignore"), nuevo_row], ignore_index=True)
-           exito, mensaje = guardar_en_nube(df_actualizado)
+            exito, mensaje = guardar_en_nube(df_actualizado)
             if exito:
                 st.session_state.modo_revision = False
                 st.session_state.ignorar_alerta_cuadre = False
