@@ -1,188 +1,280 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from streamlit_gsheets import GSheetsConnection
 
+# =============================================================
+# CONFIGURACIÓN GENERAL
+# =============================================================
 META_ESPANA = 522800
+
+# OJO: este es el nombre de la PESTAÑA (tab) dentro del archivo de Google Sheets,
+# no el nombre del archivo. Si tu pestaña se llama "Hoja 1" o "Sheet1", cámbialo aquí.
+WORKSHEET = "registro_financiero"
+
+COLUMNAS = ["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion"]
+
+CATEGORIAS_GASTO = [
+    "Ocio", "Entretenimiento", "Servicios basicos", "Mandado",
+    "Gasolina", "Universidad", "Prestamos o deudas", "Casa",
+]
 
 st.set_page_config(page_title="Proyecto España 2028", page_icon="🇪🇸", layout="wide")
 
-# Conexión limpia usando los Secrets configurados
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Cargar datos desde la nube usando la configuración de secrets
-try:
-    df = conn.read(worksheet="registro_financiero", ttl=600)
-    if df.empty or "ID" not in df.columns:
-        df = pd.DataFrame(columns=["Fecha", "Tipo", "Categoria", "Monto", "Descripcion", "ID", "Anio", "Mes"])
-except Exception as e:
-    st.error(f"Error al conectar con Google Sheets: {e}")
-    df = pd.DataFrame(columns=["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion"])
 
-# Función para guardar en Google Sheets
-def guardar_en_nube(df_a_guardar):
+# =============================================================
+# UTILIDADES DE DATOS
+# =============================================================
+def df_vacio() -> pd.DataFrame:
+    """DataFrame vacío con el esquema correcto y tipos estables."""
+    vacio = pd.DataFrame(columns=COLUMNAS)
+    vacio["Monto"] = vacio["Monto"].astype(float)
+    vacio["Anio"] = vacio["Anio"].astype("Int64")
+    vacio["Mes"] = vacio["Mes"].astype("Int64")
+    return vacio
+
+
+def normalizar(datos: pd.DataFrame) -> pd.DataFrame:
+    """Garantiza columnas, tipos y campos derivados. Nunca falla por columnas ausentes."""
+    if datos is None or datos.empty:
+        return df_vacio()
+
+    datos = datos.copy()
+
+    # Google Sheets suele devolver filas y columnas fantasma completamente vacías
+    datos = datos.dropna(how="all")
+    datos = datos.loc[:, ~datos.columns.astype(str).str.startswith("Unnamed")]
+
+    for col in COLUMNAS:
+        if col not in datos.columns:
+            datos[col] = None
+
+    # Monto SIEMPRE numérico (la hoja lo puede devolver como texto "1,500")
+    datos["Monto"] = (
+        datos["Monto"].astype(str)
+        .str.replace(r"[^0-9\.\-]", "", regex=True)
+        .replace("", None)
+    )
+    datos["Monto"] = pd.to_numeric(datos["Monto"], errors="coerce").fillna(0.0)
+
+    # Fecha normalizada
+    fecha_dt = pd.to_datetime(datos["Fecha"], errors="coerce")
+    datos = datos[fecha_dt.notna()].copy()
+    fecha_dt = fecha_dt[fecha_dt.notna()]
+
+    if datos.empty:
+        return df_vacio()
+
+    datos["Fecha"] = fecha_dt.dt.strftime("%Y-%m-%d")
+    datos["Fecha_DT"] = fecha_dt
+    datos["Anio"] = fecha_dt.dt.year.astype(int)
+    datos["Mes"] = fecha_dt.dt.month.astype(int)
+    datos["Periodo_Label"] = fecha_dt.dt.strftime("%Y - %m")
+
+    # Texto limpio
+    for col in ["Tipo", "Categoria", "Descripcion"]:
+        datos[col] = datos[col].fillna("").astype(str).str.strip()
+
+    # IDs faltantes o duplicados
+    datos["ID"] = datos["ID"].astype(str).replace({"nan": "", "None": ""})
+    faltantes = datos["ID"] == ""
+    if faltantes.any():
+        base = int(pd.Timestamp.now().timestamp())
+        datos.loc[faltantes, "ID"] = [str(base + i) for i in range(int(faltantes.sum()))]
+
+    return datos.reset_index(drop=True)
+
+
+def para_guardar(datos: pd.DataFrame) -> pd.DataFrame:
+    """Deja solo las columnas reales de la hoja, en orden fijo."""
+    limpio = datos.drop(columns=["Fecha_DT", "Periodo_Label"], errors="ignore").copy()
+    for col in COLUMNAS:
+        if col not in limpio.columns:
+            limpio[col] = None
+    return limpio[COLUMNAS].reset_index(drop=True)
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando datos desde Google Sheets...")
+def leer_hoja():
+    return conn.read(worksheet=WORKSHEET)
+
+
+def guardar_en_nube(df_a_guardar: pd.DataFrame):
     try:
-        conn.update(worksheet="registro_financiero", data=df_a_guardar)
+        conn.update(worksheet=WORKSHEET, data=para_guardar(df_a_guardar))
         st.cache_data.clear()
-        return True, "¡Guardado exitosamente en la nube!"
+        return True, "✅ ¡Guardado exitosamente en la nube!"
     except Exception as e:
         return False, f"⚠️ Error al guardar en Google Sheets: {e}"
 
-# Validar formato de fecha y columnas base
-if not df.empty and "Fecha" in df.columns:
-    df["Fecha_DT"] = pd.to_datetime(df["Fecha"], errors="coerce")
-    df["Anio"] = df["Fecha_DT"].dt.year.fillna(date.today().year).astype(int)
-    df["Mes"] = df["Fecha_DT"].dt.month.fillna(date.today().month).astype(int)
-    df["ID"] = df["ID"].astype(str)
-else:
-    df = pd.DataFrame(columns=["ID", "Fecha", "Anio", "Mes", "Tipo", "Categoria", "Monto", "Descripcion"])
+
+# =============================================================
+# CARGA DE DATOS
+# =============================================================
+error_conexion = None
+try:
+    df = normalizar(leer_hoja())
+except Exception as e:
+    error_conexion = e
+    df = df_vacio()
 
 st.title("🇪🇸 Tablero Financiero: Proyecto España 2028")
 
-if "modo_revision" not in st.session_state:
-    st.session_state.modo_revision = False
-if "ignorar_alerta_cuadre" not in st.session_state:
-    st.session_state.ignorar_alerta_cuadre = False
+if error_conexion is not None:
+    st.error(
+        f"No se pudo leer la hoja **{WORKSHEET}**.\n\n"
+        f"Detalle técnico: `{error_conexion}`\n\n"
+        "Revisa que en los *Secrets* el campo `spreadsheet` sea la **URL completa** del archivo, "
+        "que la pestaña se llame exactamente igual que `WORKSHEET`, y que la hoja esté compartida "
+        "como **Editor** con la cuenta de servicio."
+    )
 
-# --- CONFIGURACIÓN EN MEMORIA DE PRESUPUESTOS Y RECURRENCIA ---
+# Estados de sesión
+st.session_state.setdefault("modo_revision", False)
+st.session_state.setdefault("ignorar_alerta_cuadre", False)
+
 if "presupuestos_items" not in st.session_state:
-    st.session_state.presupuestos_items = pd.DataFrame([
-        {"Categoria": "Ocio", "Detalle": "General", "Monto": 3000.0, "Dia_Pago": None, "Expiracion": None},
-        {"Categoria": "Entretenimiento", "Detalle": "General", "Monto": 298.0, "Dia_Pago": None, "Expiracion": None},
-        {"Categoria": "Mandado", "Detalle": "General", "Monto": 9000.0, "Dia_Pago": None, "Expiracion": None},
-        {"Categoria": "Servicios basicos", "Detalle": "General", "Monto": 1500.0, "Dia_Pago": None, "Expiracion": None},
-        {"Categoria": "Gasolina", "Detalle": "General", "Monto": 2000.0, "Dia_Pago": None, "Expiracion": None},
-        {"Categoria": "Universidad", "Detalle": "Colegiatura", "Monto": 2800.0, "Dia_Pago": 20, "Expiracion": None},
-        {"Categoria": "Prestamos o deudas", "Detalle": "Deuda Fija", "Monto": 1300.0, "Dia_Pago": None, "Expiracion": None},
-        {"Categoria": "Prestamos o deudas", "Detalle": "Préstamo a liquidar", "Monto": 2000.0, "Dia_Pago": None, "Expiracion": date(2025, 12, 31)},
-        {"Categoria": "Casa", "Detalle": "General", "Monto": 5000.0, "Dia_Pago": 1, "Expiracion": None}
-    ])
+    st.session_state.presupuestos_items = pd.DataFrame(
+        [
+            {"Categoria": "Ocio", "Detalle": "General", "Monto": 3000.0, "Expiracion": pd.NaT},
+            {"Categoria": "Entretenimiento", "Detalle": "General", "Monto": 298.0, "Expiracion": pd.NaT},
+            {"Categoria": "Mandado", "Detalle": "General", "Monto": 9000.0, "Expiracion": pd.NaT},
+            {"Categoria": "Servicios basicos", "Detalle": "General", "Monto": 1500.0, "Expiracion": pd.NaT},
+            {"Categoria": "Gasolina", "Detalle": "General", "Monto": 2000.0, "Expiracion": pd.NaT},
+            {"Categoria": "Universidad", "Detalle": "General", "Monto": 3000.0, "Expiracion": pd.NaT},
+            {"Categoria": "Prestamos o deudas", "Detalle": "Deuda Fija", "Monto": 1300.0, "Expiracion": pd.NaT},
+            {"Categoria": "Prestamos o deudas", "Detalle": "Préstamo a liquidar", "Monto": 2000.0,
+             "Expiracion": pd.Timestamp("2025-12-31")},
+            {"Categoria": "Casa", "Detalle": "General", "Monto": 5000.0, "Expiracion": pd.NaT},
+        ]
+    )
+    st.session_state.presupuestos_items["Expiracion"] = pd.to_datetime(
+        st.session_state.presupuestos_items["Expiracion"], errors="coerce"
+    )
 
-if "dias_cobro_mes" not in st.session_state:
-    st.session_state.dias_cobro_mes = [15, 30]
 
-if "dia_cobro_semanal" not in st.session_state:
-    st.session_state.dia_cobro_semanal = "Ninguno" # Opciones: Lunes a Domingo
-
-# Función para calcular límites totales ignorando montos expirados y preparar semáforo
 def calcular_presupuestos_activos():
-    hoy = date.today()
-    activos = {}
-    expirados = []
-    items_vigentes = []
-    
-    for idx, row in st.session_state.presupuestos_items.iterrows():
+    """Suma los montos por categoría ignorando los que ya vencieron."""
+    hoy = pd.Timestamp(date.today())
+    activos, expirados = {}, []
+
+    for _, row in st.session_state.presupuestos_items.iterrows():
         cat = row.get("Categoria")
-        det = row.get("Detalle", "")
-        monto = row.get("Monto", 0.0)
-        dia_pago = row.get("Dia_Pago")
-        exp = row.get("Expiracion")
-        
-        if pd.isna(cat) or cat == "": continue
-        if pd.isna(monto): monto = 0.0
-            
-        es_activo = True
-        if pd.notna(exp) and exp != "":
-            if isinstance(exp, str):
-                try:
-                    exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-                except:
-                    exp_date = hoy
-            else:
-                exp_date = exp
-                
-            if isinstance(exp_date, date) and hoy > exp_date:
-                es_activo = False
-                expirados.append(f"{cat} ({det})")
-                
-        if es_activo:
-            if cat not in activos:
-                activos[cat] = 0.0
-            activos[cat] += float(monto)
-            
-            dia_limpio = int(dia_pago) if pd.notna(dia_pago) and str(dia_pago).strip() != "" else None
-            items_vigentes.append({"Categoria": cat, "Detalle": det, "Monto": float(monto), "Dia_Pago": dia_limpio})
-            
-    return activos, expirados, items_vigentes
+        if pd.isna(cat) or str(cat).strip() == "":
+            continue
 
-presupuestos_activos, expirados, items_vigentes = calcular_presupuestos_activos()
+        detalle = row.get("Detalle") if pd.notna(row.get("Detalle")) else ""
+        monto = row.get("Monto")
+        monto = 0.0 if pd.isna(monto) else float(monto)
 
-# --- SECCIÓN PRINCIPAL: FILTROS INTERACTIVOS ---
+        exp = pd.to_datetime(row.get("Expiracion"), errors="coerce")
+        if pd.notna(exp) and hoy > exp:
+            expirados.append(f"{cat} ({detalle})")
+            continue
+
+        activos[cat] = activos.get(cat, 0.0) + monto
+
+    return activos, expirados
+
+
+presupuestos_activos, expirados = calcular_presupuestos_activos()
+
+
+# =============================================================
+# FILTROS
+# =============================================================
 st.subheader("🔍 Selector de Periodos y Acumulados")
 
-if not df.empty and "Fecha" in df.columns:
-    df["Periodo_Label"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime('%Y - %B')
+MESES_NOMBRES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+    7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+}
+
+if not df.empty:
     periodos_disponibles = sorted(df["Periodo_Label"].dropna().unique(), reverse=True)
-    mes_actual_label = pd.Timestamp.now().strftime('%Y - %B')
-    default_selection = [mes_actual_label] if mes_actual_label in periodos_disponibles else (periodos_disponibles[:1] if periodos_disponibles else [])
-    
+    etiqueta_actual = pd.Timestamp.now().strftime("%Y - %m")
+    if etiqueta_actual in periodos_disponibles:
+        seleccion_default = [etiqueta_actual]
+    else:
+        seleccion_default = periodos_disponibles[:1]
+
     col_f1, col_f2 = st.columns([2, 1])
     with col_f1:
         meses_seleccionados = st.multiselect(
-            "Selecciona los meses a sumar (Acumulado flexible):",
+            "Selecciona los meses a sumar (acumulado flexible):",
             options=periodos_disponibles,
-            default=default_selection
+            default=seleccion_default,
+            format_func=lambda p: f"{p.split(' - ')[0]} - {MESES_NOMBRES[int(p.split(' - ')[1])]}",
         )
     with col_f2:
-        anios_disponibles = sorted(df["Anio"].dropna().unique(), reverse=True) if "Anio" in df.columns else [date.today().year]
-        if not anios_disponibles:
-            anios_disponibles = [date.today().year]
-        anio_seleccionado = st.selectbox("Seleccionar Año para Resumen Anual:", options=anios_disponibles, index=0)
+        anios_disponibles = sorted(df["Anio"].dropna().unique().tolist(), reverse=True)
+        anio_seleccionado = st.selectbox("Año para el resumen anual:", options=anios_disponibles, index=0)
 
     df_filtrado = df[df["Periodo_Label"].isin(meses_seleccionados)]
 else:
-    df_filtrado = pd.DataFrame(columns=df.columns)
-    anios_disponibles = [date.today().year]
+    st.info("Aún no hay movimientos registrados. Usa la barra lateral para capturar el primero.")
+    df_filtrado = df_vacio()
     anio_seleccionado = date.today().year
 
 st.divider()
 
-total_ingresos_f = df_filtrado[df_filtrado["Tipo"] == "Ingreso"]["Monto"].sum() if not df_filtrado.empty and "Tipo" in df_filtrado.columns else 0.0
-total_gastos_f = df_filtrado[df_filtrado["Tipo"] == "Gasto"]["Monto"].sum() if not df_filtrado.empty and "Tipo" in df_filtrado.columns else 0.0
-total_ahorro_f = df_filtrado[df_filtrado["Tipo"] == "Ahorro"]["Monto"].sum() if not df_filtrado.empty and "Tipo" in df_filtrado.columns else 0.0
+
+def suma_por_tipo(datos: pd.DataFrame, tipo: str) -> float:
+    if datos.empty:
+        return 0.0
+    return float(datos.loc[datos["Tipo"] == tipo, "Monto"].sum())
+
+
+total_ingresos_f = suma_por_tipo(df_filtrado, "Ingreso")
+total_gastos_f = suma_por_tipo(df_filtrado, "Gasto")
+total_ahorro_f = suma_por_tipo(df_filtrado, "Ahorro")
 suma_gastos_ahorro = total_gastos_f + total_ahorro_f
 
-alerta_cuadre_activa = False
-if total_ingresos_f > 0 and abs(suma_gastos_ahorro - total_ingresos_f) > 1.0:
-    alerta_cuadre_activa = True
+alerta_cuadre_activa = total_ingresos_f > 0 and abs(suma_gastos_ahorro - total_ingresos_f) > 1.0
 
-# --- BARRA LATERAL: REGISTRO DINÁMICO ---
+
+# =============================================================
+# BARRA LATERAL
+# =============================================================
 if st.session_state.modo_revision:
-    st.sidebar.warning("🔒 **Registro bloqueado**\n\nEstás en modo de revisión de historial para corregir errores.")
+    st.sidebar.warning("🔒 **Registro bloqueado**\n\nEstás en modo de revisión del historial.")
+    if st.sidebar.button("Salir del modo revisión", use_container_width=True):
+        st.session_state.modo_revision = False
+        st.rerun()
 else:
     st.sidebar.header("📝 Registrar Movimiento")
     fecha = st.sidebar.date_input("Fecha", date.today())
-    tipo = st.sidebar.selectbox("Tipo de Movimiento", ["Gasto", "Ingreso", "Ahorro"], key="tipo_mov")
+    tipo = st.sidebar.selectbox("Tipo de movimiento", ["Gasto", "Ingreso", "Ahorro"], key="tipo_mov")
 
     if tipo == "Gasto":
-        categorias_gasto = ["Ocio", "Entretenimiento", "Servicios basicos", "Mandado", "Gasolina", "Universidad", "Prestamos o deudas", "Casa"]
-        categoria = st.sidebar.selectbox("Categoría", categorias_gasto, key="cat_gasto")
+        categoria = st.sidebar.selectbox("Categoría", CATEGORIAS_GASTO, key="cat_gasto")
     elif tipo == "Ahorro":
         categoria = st.sidebar.selectbox("Categoría", ["Fondo España"], key="cat_ahorro")
     else:
         categoria = st.sidebar.selectbox("Categoría", ["Sueldo Fijo", "Trabajos Extra"], key="cat_ingreso")
-        
-    monto = st.sidebar.number_input("Monto ($)", min_value=0.0, step=100.0, key="monto_mov")
-    descripcion = st.sidebar.text_input("Descripción (Ej. Super, Gasolina, Cena)", key="desc_mov")
 
-    if st.sidebar.button("Guardar Movimiento", type="primary"):
-        if fecha.year < 2024 or fecha.year > 2035:
+    monto = st.sidebar.number_input("Monto ($)", min_value=0.0, step=100.0, key="monto_mov")
+    descripcion = st.sidebar.text_input("Descripción (ej. súper, gasolina, cena)", key="desc_mov")
+
+    if st.sidebar.button("Guardar Movimiento", type="primary", use_container_width=True):
+        if not (2024 <= fecha.year <= 2035):
             st.sidebar.error("⚠️ El año seleccionado está fuera del rango válido.")
         elif monto <= 0:
             st.sidebar.error("⚠️ El monto debe ser mayor a 0.")
         else:
-            nuevo_id = str(int(pd.Timestamp.now().timestamp()))
-            nuevo_row = pd.DataFrame({
-                "Fecha": [str(fecha)],
-                "Tipo": [tipo],
-                "Categoria": [categoria],
-                "Monto": [float(monto)],
-                "Descripcion": [descripcion],
-                "ID": [nuevo_id],
-                "Anio": [int(fecha.year)],
-                "Mes": [int(fecha.month)]
-            })
-            df_actualizado = pd.concat([df.drop(columns=["Fecha_DT", "Periodo_Label"], errors="ignore"), nuevo_row], ignore_index=True)
+            nuevo_row = pd.DataFrame([{
+                "ID": str(int(pd.Timestamp.now().timestamp() * 1000)),
+                "Fecha": fecha.strftime("%Y-%m-%d"),
+                "Anio": int(fecha.year),
+                "Mes": int(fecha.month),
+                "Tipo": tipo,
+                "Categoria": categoria,
+                "Monto": float(monto),
+                "Descripcion": descripcion,
+            }])
+            df_actualizado = pd.concat([para_guardar(df), nuevo_row], ignore_index=True)
             exito, mensaje = guardar_en_nube(df_actualizado)
             if exito:
                 st.session_state.modo_revision = False
@@ -193,24 +285,22 @@ else:
                 st.sidebar.error(mensaje)
 
 st.sidebar.divider()
+st.sidebar.caption(f"Registros en la hoja: {len(df)}")
 
-# --- ALERTA DE CUADRE ---
+
+# =============================================================
+# ALERTA DE CUADRE
+# =============================================================
 if alerta_cuadre_activa and not st.session_state.ignorar_alerta_cuadre:
-    st.markdown(
-        f"""
-        <div style="background-color: #ffe6e6; padding: 20px; border-radius: 10px; border: 1px solid #ff9999; margin-bottom: 20px;">
-            <h4 style="color: #990000; margin-top: 0; margin-bottom: 10px;">🚨 ALERTA DE DESAJUSTE FINANCIERO EN EL PERIODO</h4>
-            <p style="font-size: 16px; color: #721c24; margin-bottom: 0;">
-                Los datos no cuadran: tus ingresos totales (<b>${total_ingresos_f:,.2f}</b>) no coinciden con la suma de tus gastos y ahorros (<b>${suma_gastos_ahorro:,.2f}</b>).
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True
+    st.error(
+        "🚨 **Desajuste financiero en el periodo**\n\n"
+        f"Tus ingresos (**${total_ingresos_f:,.2f}**) no coinciden con la suma de gastos y ahorros "
+        f"(**${suma_gastos_ahorro:,.2f}**). Diferencia: **${total_ingresos_f - suma_gastos_ahorro:,.2f}**."
     )
-    
+
     col_al1, col_al2, col_al3 = st.columns(3)
     with col_al1:
-        if st.button("📝 Los datos no cuadran porque faltan movimientos por registrar", type="primary", use_container_width=True):
+        if st.button("📝 Faltan movimientos por registrar", type="primary", use_container_width=True):
             st.session_state.ignorar_alerta_cuadre = True
             st.session_state.modo_revision = False
             st.rerun()
@@ -220,248 +310,234 @@ if alerta_cuadre_activa and not st.session_state.ignorar_alerta_cuadre:
             st.session_state.modo_revision = False
             st.rerun()
     with col_al3:
-        if st.button("🔍 Revisar el historial de movimientos", use_container_width=True):
+        if st.button("🔍 Revisar el historial", use_container_width=True):
             st.session_state.modo_revision = True
             st.session_state.ignorar_alerta_cuadre = False
             st.rerun()
     st.divider()
 
-# --- PESTAÑAS PRINCIPALES ---
-tab_mes, tab_anual, tab_presupuestos, tab_admin = st.tabs(["📊 Resumen de Periodo", "📅 Resumen del Año", "💰 Presupuestos", "⚙️ Administrar Historial"])
+
+# =============================================================
+# PESTAÑAS
+# =============================================================
+tab_mes, tab_anual, tab_presupuestos, tab_admin = st.tabs(
+    ["📊 Resumen de Periodo", "📅 Resumen del Año", "💰 Presupuestos", "⚙️ Administrar Historial"]
+)
 
 with tab_mes:
-    st.header("Resumen del Periodo Seleccionado")
-    total_ingresos = total_ingresos_f
-    total_gastos = total_gastos_f
-    total_ahorro_mes = total_ahorro_f
+    st.header("Resumen del periodo seleccionado")
 
-    margen_libre = total_ingresos - total_gastos
-    tasa_ahorro = (total_ahorro_mes / total_ingresos * 100) if total_ingresos > 0 else 0.0
+    margen_libre = total_ingresos_f - total_gastos_f
+    tasa_ahorro = (total_ahorro_f / total_ingresos_f * 100) if total_ingresos_f > 0 else 0.0
 
-    fondo_espana_historico = df[df["Categoria"] == "Fondo España"]["Monto"].sum() if not df.empty and "Categoria" in df.columns else 0.0
-    faltante_meta = META_ESPANA - fondo_espana_historico
+    fondo_espana = float(df.loc[df["Categoria"] == "Fondo España", "Monto"].sum()) if not df.empty else 0.0
+    faltante_meta = max(META_ESPANA - fondo_espana, 0.0)
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Ingresos Totales", f"${total_ingresos:,.2f}")
-    col2.metric("Gastos Totales", f"${total_gastos:,.2f}")
-    col3.metric("Margen Libre", f"${margen_libre:,.2f}", delta=f"{tasa_ahorro:.1f}% tasa ahorro")
-    col4.metric("Fondo España Acumulado", f"${fondo_espana_historico:,.2f}", delta=f"Faltan ${faltante_meta:,.2f}")
+    col1.metric("Ingresos totales", f"${total_ingresos_f:,.2f}")
+    col2.metric("Gastos totales", f"${total_gastos_f:,.2f}")
+    col3.metric("Margen libre", f"${margen_libre:,.2f}", delta=f"{tasa_ahorro:.1f}% tasa de ahorro")
+    col4.metric("Fondo España acumulado", f"${fondo_espana:,.2f}", delta=f"Faltan ${faltante_meta:,.2f}")
 
-    if META_ESPANA > 0:
-        st.progress(min(fondo_espana_historico / META_ESPANA, 1.0))
+    avance = 0.0 if META_ESPANA <= 0 else min(max(fondo_espana / META_ESPANA, 0.0), 1.0)
+    st.progress(avance, text=f"Avance hacia la meta: {avance * 100:.1f}%")
 
-    if not df_filtrado.empty and "Tipo" in df_filtrado.columns:
+    if not df_filtrado.empty:
         for cat_obj, lim_val in presupuestos_activos.items():
-            gasto_act = df_filtrado[(df_filtrado["Tipo"] == "Gasto") & (df_filtrado["Categoria"] == cat_obj)]["Monto"].sum()
-            if gasto_act > lim_val:
-                st.warning(f"⚠️ Alerta de Presupuesto: El gasto en **{cat_obj}** (${gasto_act:,.2f}) superó tu límite asignado de ${lim_val:,.2f}.")
+            gasto_act = float(
+                df_filtrado.loc[
+                    (df_filtrado["Tipo"] == "Gasto") & (df_filtrado["Categoria"] == cat_obj), "Monto"
+                ].sum()
+            )
+            if lim_val > 0 and gasto_act > lim_val:
+                st.warning(
+                    f"⚠️ **{cat_obj}**: gastaste ${gasto_act:,.2f} y tu límite activo es ${lim_val:,.2f} "
+                    f"(excedente de ${gasto_act - lim_val:,.2f})."
+                )
 
     st.markdown("---")
-    st.subheader("📈 Gráficas del Periodo")
-    if not df_filtrado.empty and "Tipo" in df_filtrado.columns:
+    st.subheader("📈 Gráficas del periodo")
+
+    if df_filtrado.empty:
+        st.info("Selecciona al menos un periodo con movimientos para ver las gráficas.")
+    else:
         col_g1, col_g2 = st.columns(2)
         with col_g1:
-            st.markdown("**Gastos por Categoría**")
+            st.markdown("**Gastos por categoría**")
             df_gastos = df_filtrado[df_filtrado["Tipo"] == "Gasto"]
-            if not df_gastos.empty:
-                st.bar_chart(data=df_gastos.groupby("Categoria")["Monto"].sum().reset_index(), x="Categoria", y="Monto", color="Categoria")
+            if df_gastos.empty:
+                st.info("No hay gastos registrados en este periodo.")
             else:
-                st.info("No hay gastos registrados.")
+                resumen_gastos = df_gastos.groupby("Categoria", as_index=False)["Monto"].sum()
+                st.bar_chart(resumen_gastos, x="Categoria", y="Monto")
         with col_g2:
-            st.markdown("**Comparativa: Ingresos vs Gastos vs Ahorros**")
-            st.bar_chart(data=pd.DataFrame({"Concepto": ["Ingresos", "Gastos", "Ahorro España"], "Monto": [total_ingresos, total_gastos, total_ahorro_mes]}).set_index("Concepto"))
+            st.markdown("**Ingresos vs gastos vs ahorro**")
+            comparativa = pd.DataFrame(
+                {"Monto": [total_ingresos_f, total_gastos_f, total_ahorro_f]},
+                index=["Ingresos", "Gastos", "Ahorro España"],
+            )
+            st.bar_chart(comparativa)
 
 with tab_anual:
-    st.header(f"📅 Resumen Anual: {anio_seleccionado} (Enero a Diciembre)")
-    if not df.empty and "Anio" in df.columns:
-        df_anual = df[df["Anio"] == anio_seleccionado]
-        ingresos_anio = df_anual[df_anual["Tipo"] == "Ingreso"]["Monto"].sum() if "Tipo" in df_anual.columns else 0.0
-        gastos_anio = df_anual[df_anual["Tipo"] == "Gasto"]["Monto"].sum() if "Tipo" in df_anual.columns else 0.0
-        ahorro_anio = df_anual[df_anual["Tipo"] == "Ahorro"]["Monto"].sum() if "Tipo" in df_anual.columns else 0.0
-        margen_anio = ingresos_anio - gastos_anio
-        tasa_ahorro_anio = (ahorro_anio / ingresos_anio * 100) if ingresos_anio > 0 else 0.0
-        faltante_meta = META_ESPANA - (df[df["Categoria"] == "Fondo España"]["Monto"].sum() if "Categoria" in df.columns else 0.0)
-        
-        col_a1, col_a2, col_a3, col_a4, col_a5 = st.columns(5)
-        col_a1.metric("Ingresos Anuales", f"${ingresos_anio:,.2f}")
-        col_a2.metric("Gastos Anuales", f"${gastos_anio:,.2f}")
-        col_a3.metric("Ahorro Anual", f"${ahorro_anio:,.2f}")
-        col_a4.metric("Tasa de Ahorro", f"{tasa_ahorro_anio:.1f}%")
-        col_a5.metric("Faltante Meta", f"${faltante_meta:,.2f}")
-        
-        st.markdown("---")
-        modo_visual = st.radio("Modo de visualización anual:", ["Mes a Mes (Detalle)", "Periodo Completo Anual (Acumulado)"], horizontal=True)
-        meses_nombres = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
-        
-        if not df_anual.empty and "Mes" in df_anual.columns and "Tipo" in df_anual.columns:
-            tabla_mensual = df_anual.groupby(["Mes", "Tipo"])["Monto"].sum().unstack(fill_value=0).reset_index()
-            for col in ["Ingreso", "Gasto", "Ahorro"]:
-                if col not in tabla_mensual.columns:
-                    tabla_mensual[col] = 0.0
-            tabla_mensual["Nombre Mes"] = tabla_mensual["Mes"].map(meses_nombres)
-            todos_meses_df = pd.DataFrame({"Mes": range(1, 13)})
-            todos_meses_df["Nombre Mes"] = todos_meses_df["Mes"].map(meses_nombres)
-            tabla_completa = pd.merge(todos_meses_df, tabla_mensual, on=["Mes", "Nombre Mes"], how="left").fillna(0)
-            tabla_completa["Nombre Mes"] = pd.Categorical(tabla_completa["Nombre Mes"], categories=list(meses_nombres.values()), ordered=True)
-            tabla_completa = tabla_completa.sort_values("Mes")
-            
-            if modo_visual == "Mes a Mes (Detalle)":
-                st.dataframe(tabla_completa[["Mes", "Nombre Mes", "Ingreso", "Gasto", "Ahorro"]].rename(columns={"Ingreso": "Ingresos ($)", "Gasto": "Gastos ($)", "Ahorro": "Ahorro ($)"}), use_container_width=True, hide_index=True)
-                st.line_chart(tabla_completa.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
-            else:
-                st.line_chart(tabla_completa.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
+    st.header(f"📅 Resumen anual: {anio_seleccionado}")
+
+    df_anual = df[df["Anio"] == anio_seleccionado] if not df.empty else df_vacio()
+
+    ingresos_anio = suma_por_tipo(df_anual, "Ingreso")
+    gastos_anio = suma_por_tipo(df_anual, "Gasto")
+    ahorro_anio = suma_por_tipo(df_anual, "Ahorro")
+    tasa_ahorro_anio = (ahorro_anio / ingresos_anio * 100) if ingresos_anio > 0 else 0.0
+    fondo_total = float(df.loc[df["Categoria"] == "Fondo España", "Monto"].sum()) if not df.empty else 0.0
+
+    col_a1, col_a2, col_a3, col_a4, col_a5 = st.columns(5)
+    col_a1.metric("Ingresos anuales", f"${ingresos_anio:,.2f}")
+    col_a2.metric("Gastos anuales", f"${gastos_anio:,.2f}")
+    col_a3.metric("Ahorro anual", f"${ahorro_anio:,.2f}")
+    col_a4.metric("Tasa de ahorro", f"{tasa_ahorro_anio:.1f}%")
+    col_a5.metric("Faltante meta", f"${max(META_ESPANA - fondo_total, 0.0):,.2f}")
+
+    st.markdown("---")
+
+    if df_anual.empty:
+        st.info(f"No hay movimientos registrados en {anio_seleccionado}.")
+    else:
+        modo_visual = st.radio(
+            "Modo de visualización:",
+            ["Mes a mes (detalle)", "Acumulado del año"],
+            horizontal=True,
+        )
+
+        tabla = df_anual.groupby(["Mes", "Tipo"])["Monto"].sum().unstack(fill_value=0.0).reset_index()
+        for col in ["Ingreso", "Gasto", "Ahorro"]:
+            if col not in tabla.columns:
+                tabla[col] = 0.0
+
+        todos = pd.DataFrame({"Mes": range(1, 13)})
+        tabla = todos.merge(tabla, on="Mes", how="left").fillna(0.0)
+        tabla["Nombre Mes"] = tabla["Mes"].map(MESES_NOMBRES)
+        tabla = tabla.sort_values("Mes")
+
+        if modo_visual == "Mes a mes (detalle)":
+            st.dataframe(
+                tabla[["Nombre Mes", "Ingreso", "Gasto", "Ahorro"]].rename(
+                    columns={"Nombre Mes": "Mes", "Ingreso": "Ingresos ($)",
+                             "Gasto": "Gastos ($)", "Ahorro": "Ahorro ($)"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.line_chart(tabla.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
+        else:
+            acumulado = tabla.copy()
+            acumulado[["Ingreso", "Gasto", "Ahorro"]] = acumulado[["Ingreso", "Gasto", "Ahorro"]].cumsum()
+            st.line_chart(acumulado.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
 
 with tab_presupuestos:
-    st.header("💰 Control de Partidas y Obligaciones")
-    
-    col_p1, col_p2 = st.columns([1, 1])
-    with col_p1:
-        st.markdown("**1. Días de Cobro Mensuales:**")
-        st.session_state.dias_cobro_mes = st.multiselect(
-            "Días fijos del mes en que cobras:",
-            options=list(range(1, 32)),
-            default=st.session_state.dias_cobro_mes
-        )
-    with col_p2:
-        st.markdown("**2. Cobro Semanal Recurrente (Ej. Cada Sábado):**")
-        dias_semana_opciones = ["Ninguno", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-        st.session_state.dia_cobro_semanal = st.selectbox(
-            "Selecciona si cobras cada semana en un día fijo:",
-            options=dias_semana_opciones,
-            index=dias_semana_opciones.index(st.session_state.dia_cobro_semanal) if st.session_state.dia_cobro_semanal in dias_semana_opciones else 0
-        )
+    st.header("💰 Control de partidas y vencimientos")
+    st.markdown(
+        "Divide cada categoría en los conceptos que quieras y ponles fecha de expiración. "
+        "Cuando la fecha pase, el monto deja de contar automáticamente."
+    )
 
-    st.divider()
+    cat_seleccionada = st.selectbox("📂 Categoría a revisar o editar:", CATEGORIAS_GASTO)
 
-    st.markdown("**3. Edita tus Partidas y Fechas Fijas de Pago:** El número de día (1-31) que coloques se repetirá automáticamente todos los meses sin que tengas que volver a escribirlo.")
-    
-    categorias_presupuesto = ["Ocio", "Entretenimiento", "Servicios basicos", "Mandado", "Gasolina", "Universidad", "Prestamos o deudas", "Casa"]
-    cat_seleccionada = st.selectbox("📂 Selecciona la Categoría a revisar/editar:", categorias_presupuesto)
-    
-    st.markdown(f"**Desglose de montos para: {cat_seleccionada}**")
-    
-    df_cat = st.session_state.presupuestos_items[st.session_state.presupuestos_items["Categoria"] == cat_seleccionada].copy()
-    
+    df_cat = st.session_state.presupuestos_items
+    df_cat = df_cat[df_cat["Categoria"] == cat_seleccionada][["Detalle", "Monto", "Expiracion"]].reset_index(drop=True)
+
     df_editado = st.data_editor(
-        df_cat[["Detalle", "Monto", "Dia_Pago", "Expiracion"]],
+        df_cat,
         column_config={
-            "Detalle": st.column_config.TextColumn("Concepto / Nombre del gasto", required=True),
-            "Monto": st.column_config.NumberColumn("Monto ($)", min_value=0.0, format="$%f", step=100.0, required=True),
-            "Dia_Pago": st.column_config.NumberColumn("Día de Pago Fijo (1-31)", min_value=1, max_value=31, step=1),
-            "Expiracion": st.column_config.DateColumn("Fecha Expiración (Opcional)")
+            "Detalle": st.column_config.TextColumn("Concepto", required=True),
+            "Monto": st.column_config.NumberColumn("Monto ($)", min_value=0.0, format="$%.2f", step=100.0, required=True),
+            "Expiracion": st.column_config.DateColumn("Expira el (opcional)", format="YYYY-MM-DD"),
         },
         use_container_width=True,
         num_rows="dynamic",
-        key=f"editor_{cat_seleccionada}"
+        key=f"editor_presupuesto_{cat_seleccionada}",
     )
-    
-    df_cat_comp = df_cat[["Detalle", "Monto", "Dia_Pago", "Expiracion"]].fillna("")
-    df_editado_comp = df_editado.fillna("")
-    
-    if df_cat_comp.to_dict('records') != df_editado_comp.to_dict('records'):
-        temp_df = st.session_state.presupuestos_items[st.session_state.presupuestos_items["Categoria"] != cat_seleccionada].copy()
-        if not df_editado.empty:
-            df_editado["Categoria"] = cat_seleccionada
-            st.session_state.presupuestos_items = pd.concat([temp_df, df_editado], ignore_index=True)
+
+    if st.button("💾 Aplicar cambios a esta categoría", type="primary"):
+        resto = st.session_state.presupuestos_items[
+            st.session_state.presupuestos_items["Categoria"] != cat_seleccionada
+        ].copy()
+
+        nuevo = df_editado.copy()
+        nuevo = nuevo[nuevo["Detalle"].notna() & (nuevo["Detalle"].astype(str).str.strip() != "")]
+        if not nuevo.empty:
+            nuevo["Categoria"] = cat_seleccionada
+            nuevo["Monto"] = pd.to_numeric(nuevo["Monto"], errors="coerce").fillna(0.0)
+            nuevo["Expiracion"] = pd.to_datetime(nuevo["Expiracion"], errors="coerce")
+            st.session_state.presupuestos_items = pd.concat([resto, nuevo], ignore_index=True)
         else:
-            st.session_state.presupuestos_items = temp_df
+            st.session_state.presupuestos_items = resto
+
+        st.success(f"Presupuesto de {cat_seleccionada} actualizado.")
         st.rerun()
 
-    # --- SEMÁFORO DE LIQUIDEZ ---
     st.divider()
-    st.subheader("🚦 Semáforo de Liquidez (Próximos 30 Días)")
-    st.markdown("El sistema autogenera tus días de cobro semanales y mensuales para contrastarlos con tus pagos fijos programados.")
-    
-    hoy = date.today()
-    eventos_radar = []
-    cobro_detectado = False
-    
-    # Mapeo de días de la semana para el cobro semanal
-    mapa_dias = {"Lunes": 0, "Martes": 1, "Miércoles": 2, "Jueves": 3, "Viernes": 4, "Sábado": 5, "Domingo": 6}
-    
-    for i in range(31):
-        dia_evaluar = hoy + timedelta(days=i)
-        
-        es_dia_cobro = False
-        # Validar cobro mensual fijo
-        if dia_evaluar.day in st.session_state.dias_cobro_mes:
-            es_dia_cobro = True
-        # Validar cobro semanal recurrente (ej. todos los sábados)
-        if st.session_state.dia_cobro_semanal != "Ninguno":
-            if dia_evaluar.weekday() == mapa_dias.get(st.session_state.dia_cobro_semanal, -1):
-                es_dia_cobro = True
-                
-        if es_dia_cobro:
-            eventos_radar.append({"Fecha": dia_evaluar, "Evento": "💰 DÍA DE COBRO", "Monto": "-", "Estado": "🟢 INGRESO"})
-            cobro_detectado = True
-            
-        # Revisar pagos obligatorios recurrentes de ese día del mes
-        for item in items_vigentes:
-            if item["Dia_Pago"] == dia_evaluar.day:
-                estado_alerta = "🟡 PRÓXIMO" if cobro_detectado or i < 3 else "🔴 ALERTA: SIN LIQUIDEZ PREVIA"
-                if i == 0: estado_alerta = "🚨 ¡PAGO HOY!"
-                
-                eventos_radar.append({
-                    "Fecha": dia_evaluar,
-                    "Evento": f"📄 Pagar: {item['Categoria']} ({item['Detalle']})",
-                    "Monto": f"${item['Monto']:,.2f}",
-                    "Estado": estado_alerta
-                })
-                
-    if eventos_radar:
-        df_radar = pd.DataFrame(eventos_radar)
-        df_radar["Fecha"] = pd.to_datetime(df_radar["Fecha"]).dt.strftime('%d-%b-%Y')
-        
-        def color_estados(val):
-            if isinstance(val, str):
-                if "🔴" in val: return 'background-color: #ffe6e6; color: #990000; font-weight: bold'
-                if "🟢" in val: return 'background-color: #e6ffe6; color: #006600; font-weight: bold'
-                if "🚨" in val: return 'background-color: #ffcccc; color: #cc0000; font-weight: bold'
-                if "🟡" in val: return 'background-color: #ffffe6; color: #b3b300; font-weight: bold'
-            return ''
-            
-        st.dataframe(df_radar.style.map(color_estados, subset=['Estado']), use_container_width=True, hide_index=True)
+    st.subheader("📋 Resumen mensual y apartado semanal (solo montos activos)")
+
+    if presupuestos_activos:
+        resumen = pd.DataFrame(
+            [
+                {
+                    "Categoría": cat,
+                    "Límite mensual activo": f"${lim:,.2f}",
+                    "Apartado semanal (÷4)": f"${lim / 4:,.2f}",
+                }
+                for cat, lim in sorted(presupuestos_activos.items())
+            ]
+        )
+        st.dataframe(resumen, use_container_width=True, hide_index=True)
     else:
-        st.info("No hay días de cobro ni pagos fijos programados en los próximos 30 días.")
+        st.info("No tienes presupuestos activos configurados.")
+
+    if expirados:
+        st.success(f"✅ Montos ya expirados y descontados del cálculo: **{', '.join(expirados)}**")
 
     st.divider()
-    st.subheader("📋 Resumen Mensual y Apartado Semanal (Solo Montos Activos)")
-    
-    if presupuestos_activos:
-        datos_mostrar = []
-        for cat, lim in presupuestos_activos.items():
-            datos_mostrar.append({
-                "Categoría": cat,
-                "Límite Mensual Activo": f"${lim:,.2f}",
-                "Apartado Semanal (x4)": f"${(lim/4):,.2f}"
-            })
-        st.table(pd.DataFrame(datos_mostrar))
-    else:
-        st.info("No tienes presupuestos activos configurados en este momento.")
-        
-    if expirados:
-        st.success(f"✅ Los siguientes montos ya expiraron y fueron descontados del cálculo: **{', '.join(expirados)}**")
-        
-    st.divider()
-    st.markdown("### 📊 Totales Globales Estimados")
+    st.markdown("### 📊 Totales globales estimados")
     total_mensual = sum(presupuestos_activos.values())
-    total_semanal = total_mensual / 4
-    
     col_t1, col_t2 = st.columns(2)
-    col_t1.metric("💰 Presupuesto Mensual Global", f"${total_mensual:,.2f}")
-    col_t2.metric("📅 Total Semanal a Apartar", f"${total_semanal:,.2f}")
+    col_t1.metric("💰 Presupuesto mensual global", f"${total_mensual:,.2f}")
+    col_t2.metric("📅 Total semanal a apartar", f"${total_mensual / 4:,.2f}")
+
+    st.caption("Nota: los presupuestos viven en la sesión. Si recargas la página vuelven a los valores base.")
 
 with tab_admin:
-    st.header("⚙️ Administrar Historial de Movimientos")
-    if not df.empty:
-        df_clean = df.drop(columns=["Fecha_DT", "Periodo_Label"], errors="ignore")
-        df_editado = st.data_editor(df_clean, num_rows="dynamic", use_container_width=True, key="editor_financiero")
-        if st.button("Guardar Cambios en la Nube"):
-            exito, mensaje = guardar_en_nube(df_editado.drop(columns=["Fecha_DT"], errors="ignore"))
-            if exito:
-                st.session_state.modo_revision = False
-                st.session_state.ignorar_alerta_cuadre = False
-                st.success(mensaje)
+    st.header("⚙️ Administrar historial de movimientos")
+
+    if df.empty:
+        st.info("No hay movimientos que administrar todavía.")
+    else:
+        st.caption("Edita celdas, agrega filas o borra las que sobren. Nada se envía a la hoja hasta que guardes.")
+
+        df_admin = st.data_editor(
+            para_guardar(df),
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "ID": st.column_config.TextColumn("ID", disabled=True),
+                "Fecha": st.column_config.TextColumn("Fecha (YYYY-MM-DD)"),
+                "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Gasto", "Ingreso", "Ahorro"]),
+                "Monto": st.column_config.NumberColumn("Monto ($)", format="$%.2f", step=100.0),
+            },
+            key="editor_financiero",
+        )
+
+        col_ad1, col_ad2 = st.columns([1, 3])
+        with col_ad1:
+            if st.button("💾 Guardar cambios en la nube", type="primary", use_container_width=True):
+                exito, mensaje = guardar_en_nube(normalizar(df_admin))
+                if exito:
+                    st.session_state.modo_revision = False
+                    st.session_state.ignorar_alerta_cuadre = False
+                    st.success(mensaje)
+                    st.rerun()
+                else:
+                    st.error(mensaje)
+        with col_ad2:
+            if st.button("🔄 Recargar desde Google Sheets", use_container_width=True):
+                st.cache_data.clear()
                 st.rerun()
-            else:
-                st.error(mensaje)
