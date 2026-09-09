@@ -30,6 +30,9 @@ COLS_BIT = ["Timestamp", "Usuario", "Accion", "Tabla", "RegistroID", "Campo",
 
 COLUMNAS_NUMERICAS = {"Monto", "MontoProgramado", "MontoPagado", "Anio", "Mes"}
 COLUMNAS_FECHA = {"Fecha", "Inicio", "Expiracion", "FechaProgramada", "FechaPago"}
+# Columnas de texto que Google Sheets devuelve como número ("15" llega como "15.0").
+# Se normalizan igual en memoria y al leer, o la verificación de concurrencia falla siempre.
+COLUMNAS_CLAVE = {"ID", "RefID", "MovimientoID", "Origen", "DiaPago", "DiaCobro", "RegistroID"}
 
 ESTADOS = ["Planeado", "Comprometido", "Pagado", "Cancelado"]
 ESTADO_ICONO = {"Planeado": "⚪ Planeado", "Comprometido": "🟡 Comprometido",
@@ -103,6 +106,39 @@ def rellenar_ids(tabla):
     return tabla
 
 
+def id_desde_contenido(fila, columnas, posicion):
+    """
+    ID reproducible para filas que llegaron sin ID desde la hoja.
+    Debe ser determinista: si cada recarga generara uno distinto, la verificación
+    de concurrencia detectaría un 'cambio' que en realidad nunca ocurrió.
+    """
+    base = f"{posicion}|" + "|".join(str(fila.get(c, "")) for c in columnas if c != "ID")
+    return "auto-" + hashlib.md5(base.encode("utf-8")).hexdigest()[:10]
+
+
+def reparar_ids(datos, columnas):
+    faltantes = datos["ID"] == ""
+    if faltantes.any():
+        datos.loc[faltantes, "ID"] = [
+            id_desde_contenido(datos.iloc[i], columnas, i)
+            for i in range(len(datos)) if faltantes.iloc[i]
+        ]
+    return datos
+
+
+def con_relleno(destino, columnas, filas_remotas):
+    """
+    conn.update sobrescribe solo el rango que escribe. Si el nuevo contenido tiene
+    menos filas que la hoja, las viejas se quedarían abajo. Se rellena con vacíos
+    para que borrar de verdad borre.
+    """
+    faltan = int(filas_remotas) - len(destino)
+    if faltan <= 0:
+        return destino
+    vacias = pd.DataFrame("", index=range(faltan), columns=list(columnas))
+    return pd.concat([destino, vacias], ignore_index=True)
+
+
 def con_reintentos(funcion, etiqueta=""):
     """Reintenta ante errores de cuota (429) o fallos transitorios de red."""
     ultimo = None
@@ -140,6 +176,8 @@ def para_escribir(datos, columnas):
     for col in columnas:
         if col not in COLUMNAS_NUMERICAS:
             limpio[col] = texto_simple(limpio[col])
+            if col in COLUMNAS_CLAVE:
+                limpio[col] = limpio[col].str.replace(r"\.0$", "", regex=True)
 
     if {"Anio", "Mes"} <= set(columnas):
         limpio["Anio"] = limpio["Anio"].astype(int)
@@ -166,7 +204,10 @@ def leer_directo(nombre, columnas):
     for col in columnas:
         if col not in datos.columns:
             datos[col] = None
-    return datos[columnas].reset_index(drop=True)
+    datos = datos[columnas].reset_index(drop=True)
+    # Las filas de relleno llegan como cadenas vacías, no como NaN
+    vacias = datos.apply(lambda f: all(str(v).strip() in ("", "nan", "None") for v in f), axis=1)
+    return datos[~vacias].reset_index(drop=True) if len(datos) else datos
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -276,29 +317,49 @@ def bitacora_evento(accion, tabla, registro_id="", detalle="", campo="", antes="
 # =============================================================
 # ESCRITURA CON CONTROL DE CONCURRENCIA
 # =============================================================
-def guardar_hoja(nombre, datos, columnas, antes=None, nota="", eventos_extra=None, auditar=True):
+def guardar_hoja(nombre, datos, columnas, antes=None, nota="", eventos_extra=None,
+                 auditar=True, normalizador=None):
     """
-    Escribe la hoja completa, pero antes verifica que nadie más la haya movido.
-    Si 'antes' viene, se registra el diff en la bitácora.
+    Escribe la hoja completa verificando antes que nadie más la haya movido.
+    'normalizador' se aplica por igual a lo que tienes en memoria y a lo que hay en
+    la hoja: sin eso, la comparación choca contra diferencias de formato que no son
+    cambios reales (Sheets devuelve el 15 como '15.0').
     """
     try:
         destino = para_escribir(datos, columnas)
+        remoto = leer_directo(nombre, columnas)
 
         if antes is not None:
-            esperada = huella(antes, columnas)
-            actual_remota = huella(leer_directo(nombre, columnas), columnas)
-            if esperada != actual_remota:
-                return False, (
-                    f"🔒 La hoja «{nombre}» cambió desde que la cargaste (otra sesión, o la "
-                    "editaste directo en Google Sheets). No se guardó nada para no borrar ese "
-                    "trabajo. Dale a «Recargar desde Google Sheets» y repite el cambio."
-                )
+            base = normalizador(antes) if normalizador else antes
+            base_remoto = normalizador(remoto) if normalizador else remoto
 
+            if huella(base, columnas) != huella(base_remoto, columnas):
+                if not st.session_state.get("forzar_guardado"):
+                    detalle = diferencias(base, base_remoto, columnas, nombre)[:3]
+                    resumen = "; ".join(
+                        f"{d['Accion']} {d['RegistroID']}"
+                        + (f" · {d['Campo']}: «{d['ValorAnterior']}» → «{d['ValorNuevo']}»"
+                           if d["Campo"] else "")
+                        for d in detalle
+                    ) or "no se pudo aislar la diferencia"
+                    return False, (
+                        f"🔒 La hoja «{nombre}» cambió desde que la cargaste. No se guardó nada "
+                        f"para no borrar ese trabajo.\n\nDiferencias detectadas: {resumen}\n\n"
+                        "Si fuiste tú desde otra pestaña, recarga y repite el cambio. Si esto se "
+                        "repite sin que nadie más haya editado, actívalo en «Opciones avanzadas» "
+                        "de la barra lateral."
+                    )
+                st.session_state["aviso_forzado"] = nombre
+
+        destino = con_relleno(destino, columnas, len(remoto))
         con_reintentos(lambda: conn.update(worksheet=nombre, data=destino), nombre)
         st.cache_data.clear()
 
         if auditar:
-            filas = diferencias(antes, destino, columnas, nombre, nota) if antes is not None else []
+            filas = []
+            if antes is not None:
+                base = normalizador(antes) if normalizador else antes
+                filas = diferencias(base, para_escribir(datos, columnas), columnas, nombre, nota)
             if eventos_extra:
                 filas.extend(eventos_extra)
             registrar_bitacora(filas)
@@ -333,12 +394,8 @@ def normalizar_movimientos(datos):
     for col in ["Tipo", "Categoria", "Descripcion", "RefID", "ID"]:
         datos[col] = texto_simple(datos[col])
 
-    faltantes = datos["ID"] == ""
-    if faltantes.any():
-        base = int(pd.Timestamp.now().timestamp() * 1000)
-        datos.loc[faltantes, "ID"] = [str(base + i) for i in range(int(faltantes.sum()))]
-
-    return datos.reset_index(drop=True)
+    datos = datos.reset_index(drop=True)
+    return reparar_ids(datos, COLS_MOV)
 
 
 def solo_columnas_mov(datos):
@@ -465,7 +522,33 @@ def normalizar_compromisos(datos):
     for col in ["FechaProgramada", "FechaPago"]:
         datos[col] = pd.to_datetime(datos[col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     datos = datos[datos["FechaProgramada"] != ""].reset_index(drop=True)
-    return rellenar_ids(datos)
+    return reparar_ids(datos, COLS_COMP)
+
+
+def normalizar_presupuestos(datos):
+    if datos is None or datos.empty:
+        return esqueleto(COLS_PRE)
+    datos = datos.copy()
+    datos["Monto"] = a_numero(datos["Monto"])
+    datos["DiaPago"] = texto_dia(datos["DiaPago"])
+    for col in ["ID", "Categoria", "Detalle", "Frecuencia"]:
+        datos[col] = texto_simple(datos[col]).str.replace(r"\.0$", "", regex=True) \
+            if col == "ID" else texto_simple(datos[col])
+    datos = datos[datos["Detalle"] != ""].reset_index(drop=True)
+    return reparar_ids(datos, COLS_PRE)
+
+
+def normalizar_cobros(datos):
+    if datos is None or datos.empty:
+        return esqueleto(COLS_COB)
+    datos = datos.copy()
+    datos["Monto"] = a_numero(datos["Monto"])
+    datos["DiaCobro"] = texto_dia(datos["DiaCobro"])
+    datos["ID"] = texto_simple(datos["ID"]).str.replace(r"\.0$", "", regex=True)
+    for col in ["Concepto", "Frecuencia"]:
+        datos[col] = texto_simple(datos[col])
+    datos = datos[datos["Concepto"] != ""].reset_index(drop=True)
+    return reparar_ids(datos, COLS_COB)
 
 
 def generar_compromisos(df_pre, df_comp, desde, hasta):
@@ -513,7 +596,7 @@ def marcar_como_pagado(df_mov, df_comp, comp_id, fecha_pago, monto_pagado, nota=
         HOJA_MOVIMIENTOS,
         pd.concat([solo_columnas_mov(df_mov), nuevo_mov], ignore_index=True),
         COLS_MOV, antes=solo_columnas_mov(df_mov),
-        nota=f"generado por compromiso {comp_id}",
+        nota=f"generado por compromiso {comp_id}", normalizador=lambda d: solo_columnas_mov(normalizar_movimientos(d)),
     )
     if not ok_mov:
         return False, msg_mov
@@ -529,6 +612,7 @@ def marcar_como_pagado(df_mov, df_comp, comp_id, fecha_pago, monto_pagado, nota=
 
     ok_comp, msg_comp = guardar_hoja(
         HOJA_COMPROMISOS, actualizado, COLS_COMP, antes=df_comp, nota="pago registrado",
+        normalizador=normalizar_compromisos,
         eventos_extra=[bitacora_evento("PAGO", HOJA_COMPROMISOS, comp_id,
                                        f"{fila['Categoria']} — {fila['Concepto']}",
                                        "Estado", fila["Estado"], "Pagado")],
@@ -552,7 +636,8 @@ def revertir_pago(df_mov, df_comp, comp_id):
         restante = df_mov[df_mov["ID"] != mov_id]
         ok_mov, msg_mov = guardar_hoja(
             HOJA_MOVIMIENTOS, solo_columnas_mov(restante), COLS_MOV,
-            antes=solo_columnas_mov(df_mov), nota=f"reversión del compromiso {comp_id}")
+            antes=solo_columnas_mov(df_mov), nota=f"reversión del compromiso {comp_id}",
+            normalizador=lambda d: solo_columnas_mov(normalizar_movimientos(d)),)
         if not ok_mov:
             return False, msg_mov
 
@@ -563,6 +648,7 @@ def revertir_pago(df_mov, df_comp, comp_id):
 
     ok_comp, msg_comp = guardar_hoja(
         HOJA_COMPROMISOS, actualizado, COLS_COMP, antes=df_comp, nota="pago revertido",
+        normalizador=normalizar_compromisos,
         eventos_extra=[bitacora_evento("REVERSION", HOJA_COMPROMISOS, comp_id,
                                        str(fila.iloc[0]["Concepto"]), "MovimientoID", mov_id, "")],
     )
@@ -573,7 +659,7 @@ def cambiar_estado(df_comp, comp_id, estado):
     actualizado = df_comp.copy()
     actualizado.loc[actualizado["ID"] == comp_id, "Estado"] = estado
     return guardar_hoja(HOJA_COMPROMISOS, actualizado, COLS_COMP, antes=df_comp,
-                        nota=f"estado → {estado}")
+                        nota=f"estado → {estado}", normalizador=normalizar_compromisos,)
 
 
 # =============================================================
@@ -589,19 +675,13 @@ except Exception as e:
     df = esqueleto(COLS_MOV)
 
 try:
-    df_pre = leer_hoja(HOJA_PRESUPUESTOS, COLS_PRE)
-    df_pre["Monto"] = a_numero(df_pre["Monto"])
-    df_pre["DiaPago"] = texto_dia(df_pre["DiaPago"])
-    df_pre["ID"] = texto_simple(df_pre["ID"])
+    df_pre = normalizar_presupuestos(leer_hoja(HOJA_PRESUPUESTOS, COLS_PRE))
 except Exception as e:
     errores.append((HOJA_PRESUPUESTOS, e))
     df_pre = esqueleto(COLS_PRE)
 
 try:
-    df_cob = leer_hoja(HOJA_COBROS, COLS_COB)
-    df_cob["Monto"] = a_numero(df_cob["Monto"])
-    df_cob["DiaCobro"] = texto_dia(df_cob["DiaCobro"])
-    df_cob["ID"] = texto_simple(df_cob["ID"])
+    df_cob = normalizar_cobros(leer_hoja(HOJA_COBROS, COLS_COB))
 except Exception as e:
     errores.append((HOJA_COBROS, e))
     df_cob = esqueleto(COLS_COB)
@@ -622,6 +702,13 @@ for nombre, err in errores:
     st.error(
         f"No se pudo leer la pestaña **{nombre}**. Verifica que exista con ese nombre exacto "
         f"y que el archivo esté compartido como Editor con la cuenta de servicio.\n\n`{err}`"
+    )
+
+if st.session_state.get("aviso_forzado"):
+    st.warning(
+        f"⚠️ El último guardado en «{st.session_state.pop('aviso_forzado')}» se hizo con la "
+        "protección de sobrescritura desactivada. Si alguien más estaba editando, sus cambios "
+        "se perdieron. Revisa la bitácora."
     )
 
 if st.session_state.get("bitacora_error"):
@@ -701,6 +788,20 @@ st.sidebar.text_input("👤 ¿Quién está capturando?", key="usuario",
                       help="Se guarda en la bitácora junto a cada cambio.")
 if not st.session_state.usuario.strip():
     st.sidebar.caption("Sin nombre, los cambios quedan como «Sin identificar».")
+
+if st.sidebar.button("🔄 Recargar desde Google Sheets", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+with st.sidebar.expander("🛠️ Opciones avanzadas"):
+    st.checkbox(
+        "Ignorar protección de sobrescritura", key="forzar_guardado",
+        help="Solo si el tablero te bloquea un guardado y estás seguro de que nadie más "
+             "editó la hoja. Con esto activo, tu versión pisa lo que haya en la nube.",
+    )
+    if st.session_state.get("forzar_guardado"):
+        st.warning("Protección desactivada. Vuelve a activarla al terminar.")
+
 st.sidebar.divider()
 
 if st.session_state.modo_revision:
@@ -753,6 +854,7 @@ else:
                 HOJA_MOVIMIENTOS,
                 pd.concat([solo_columnas_mov(df), nuevo], ignore_index=True),
                 COLS_MOV, antes=solo_columnas_mov(df), nota="captura manual",
+                normalizador=lambda d: solo_columnas_mov(normalizar_movimientos(d)),
             )
             if exito:
                 st.session_state.modo_revision = False
@@ -1032,7 +1134,8 @@ with tab_pre:
     if st.button("💾 Guardar días de cobro", type="primary"):
         limpio = cobros_edit[cobros_edit["Concepto"].astype(str).str.strip() != ""].copy()
         exito, mensaje = guardar_hoja(HOJA_COBROS, rellenar_ids(limpio), COLS_COB,
-                                      antes=df_cob, nota="edición de cobros")
+                                      antes=df_cob, nota="edición de cobros",
+                                      normalizador=normalizar_cobros,)
         if exito:
             st.success(mensaje)
             st.rerun()
@@ -1041,7 +1144,19 @@ with tab_pre:
 
     st.divider()
     st.subheader("📂 Partidas de gasto por categoría")
-    cat_sel = st.selectbox("Categoría a revisar o editar:", CATEGORIAS_GASTO)
+
+    cs1, cs2 = st.columns([3, 1])
+    with cs1:
+        cat_sel = st.selectbox("Categoría a revisar o editar:", CATEGORIAS_GASTO)
+    with cs2:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Recargar hoja", use_container_width=True, key="recargar_pre"):
+            st.cache_data.clear()
+            st.rerun()
+
+    st.caption("Para borrar una partida, selecciona su renglón con la casilla de la "
+               "izquierda, presiona Suprimir y luego guarda.")
     df_cat = df_pre[df_pre["Categoria"] == cat_sel].reset_index(drop=True)
 
     pre_edit = st.data_editor(
@@ -1067,7 +1182,8 @@ with tab_pre:
             nuevas = rellenar_ids(nuevas)
         exito, mensaje = guardar_hoja(
             HOJA_PRESUPUESTOS, pd.concat([resto, nuevas], ignore_index=True), COLS_PRE,
-            antes=df_pre, nota=f"edición de partidas · {cat_sel}")
+            antes=df_pre, nota=f"edición de partidas · {cat_sel}",
+            normalizador=normalizar_presupuestos,)
         if exito:
             st.success(mensaje)
             st.rerun()
@@ -1120,7 +1236,7 @@ with tab_comp:
                 else:
                     exito, mensaje = guardar_hoja(
                         HOJA_COMPROMISOS, pd.concat([df_comp, nuevos], ignore_index=True),
-                        COLS_COMP, antes=df_comp,
+                        COLS_COMP, antes=df_comp, normalizador=normalizar_compromisos,
                         nota=f"generación automática {gen_desde}→{gen_hasta}")
                     if exito:
                         st.success(f"Se generaron {len(nuevos)} compromiso(s).")
@@ -1282,7 +1398,8 @@ with tab_comp:
         if st.button("💾 Guardar compromisos"):
             limpio = comp_edit[comp_edit["Concepto"].astype(str).str.strip() != ""].copy()
             exito, mensaje = guardar_hoja(HOJA_COMPROMISOS, rellenar_ids(limpio), COLS_COMP,
-                                          antes=df_comp, nota="edición manual")
+                                          antes=df_comp, nota="edición manual",
+                                          normalizador=normalizar_compromisos,)
             if exito:
                 st.success(mensaje)
                 st.rerun()
@@ -1537,7 +1654,8 @@ with tab_admin:
             if st.button("💾 Guardar cambios", type="primary", use_container_width=True):
                 exito, mensaje = guardar_hoja(
                     HOJA_MOVIMIENTOS, solo_columnas_mov(normalizar_movimientos(df_admin)),
-                    COLS_MOV, antes=solo_columnas_mov(df), nota="edición desde administrar historial")
+                    COLS_MOV, antes=solo_columnas_mov(df), nota="edición desde administrar historial",
+                    normalizador=lambda d: solo_columnas_mov(normalizar_movimientos(d)),)
                 if exito:
                     st.session_state.modo_revision = False
                     st.session_state.ignorar_alerta_cuadre = False
