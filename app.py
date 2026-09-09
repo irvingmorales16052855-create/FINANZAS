@@ -44,7 +44,7 @@ if "modo_revision" not in st.session_state:
 if "ignorar_alerta_cuadre" not in st.session_state:
     st.session_state.ignorar_alerta_cuadre = False
 
-# --- CONFIGURACIÓN EN MEMORIA DE PRESUPUESTOS POR PARTIDAS Y DÍAS DE COBRO ---
+# --- CONFIGURACIÓN EN MEMORIA DE PRESUPUESTOS Y RECURRENCIA ---
 if "presupuestos_items" not in st.session_state:
     st.session_state.presupuestos_items = pd.DataFrame([
         {"Categoria": "Ocio", "Detalle": "General", "Monto": 3000.0, "Dia_Pago": None, "Expiracion": None},
@@ -58,8 +58,11 @@ if "presupuestos_items" not in st.session_state:
         {"Categoria": "Casa", "Detalle": "General", "Monto": 5000.0, "Dia_Pago": 1, "Expiracion": None}
     ])
 
-if "dias_cobro" not in st.session_state:
-    st.session_state.dias_cobro = [15, 30]
+if "dias_cobro_mes" not in st.session_state:
+    st.session_state.dias_cobro_mes = [15, 30]
+
+if "dia_cobro_semanal" not in st.session_state:
+    st.session_state.dia_cobro_semanal = "Ninguno" # Opciones: Lunes a Domingo
 
 # Función para calcular límites totales ignorando montos expirados y preparar semáforo
 def calcular_presupuestos_activos():
@@ -248,7 +251,6 @@ with tab_mes:
         st.progress(min(fondo_espana_historico / META_ESPANA, 1.0))
 
     if not df_filtrado.empty and "Tipo" in df_filtrado.columns:
-        # Aquí usamos los presupuestos_activos agrupados
         for cat_obj, lim_val in presupuestos_activos.items():
             gasto_act = df_filtrado[(df_filtrado["Tipo"] == "Gasto") & (df_filtrado["Categoria"] == cat_obj)]["Monto"].sum()
             if gasto_act > lim_val:
@@ -310,29 +312,34 @@ with tab_anual:
                 st.line_chart(tabla_completa.set_index("Nombre Mes")[["Ingreso", "Gasto", "Ahorro"]])
 
 with tab_presupuestos:
-    st.header("💰 Control de Partidas y Vencimientos")
+    st.header("💰 Control de Partidas y Obligaciones")
     
-    col_p1, col_p2 = st.columns([1, 2])
+    col_p1, col_p2 = st.columns([1, 1])
     with col_p1:
-        st.markdown("**1. Configura tus Días de Cobro:**")
-        st.session_state.dias_cobro = st.multiselect(
-            "¿Qué días del mes recibes tus ingresos?",
+        st.markdown("**1. Días de Cobro Mensuales:**")
+        st.session_state.dias_cobro_mes = st.multiselect(
+            "Días fijos del mes en que cobras:",
             options=list(range(1, 32)),
-            default=st.session_state.dias_cobro
+            default=st.session_state.dias_cobro_mes
         )
     with col_p2:
-        st.info("💡 **Tip de liquidez:** Al definir tus días de cobro y asignarle fecha a tus pagos fuertes (abajo), el sistema trazará un semáforo para que nunca te quedes corto de dinero antes de la quincena.")
+        st.markdown("**2. Cobro Semanal Recurrente (Ej. Cada Sábado):**")
+        dias_semana_opciones = ["Ninguno", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+        st.session_state.dia_cobro_semanal = st.selectbox(
+            "Selecciona si cobras cada semana en un día fijo:",
+            options=dias_semana_opciones,
+            index=dias_semana_opciones.index(st.session_state.dia_cobro_semanal) if st.session_state.dia_cobro_semanal in dias_semana_opciones else 0
+        )
 
     st.divider()
 
-    st.markdown("**2. Edita tus Partidas:** Selecciona una categoría para desglosar sus montos. Puedes añadir varios montos (ej. dividir deudas) y asignarles fechas de pago/expiración. Si la expiración ya pasó, el sistema ignorará el monto.")
+    st.markdown("**3. Edita tus Partidas y Fechas Fijas de Pago:** El número de día (1-31) que coloques se repetirá automáticamente todos los meses sin que tengas que volver a escribirlo.")
     
     categorias_presupuesto = ["Ocio", "Entretenimiento", "Servicios basicos", "Mandado", "Gasolina", "Universidad", "Prestamos o deudas", "Casa"]
     cat_seleccionada = st.selectbox("📂 Selecciona la Categoría a revisar/editar:", categorias_presupuesto)
     
     st.markdown(f"**Desglose de montos para: {cat_seleccionada}**")
     
-    # Extraer solo las filas de la categoría seleccionada
     df_cat = st.session_state.presupuestos_items[st.session_state.presupuestos_items["Categoria"] == cat_seleccionada].copy()
     
     df_editado = st.data_editor(
@@ -348,7 +355,6 @@ with tab_presupuestos:
         key=f"editor_{cat_seleccionada}"
     )
     
-    # Detectar cambios reales rellenando nulos para que la validación sea exacta
     df_cat_comp = df_cat[["Detalle", "Monto", "Dia_Pago", "Expiracion"]].fillna("")
     df_editado_comp = df_editado.fillna("")
     
@@ -359,26 +365,37 @@ with tab_presupuestos:
             st.session_state.presupuestos_items = pd.concat([temp_df, df_editado], ignore_index=True)
         else:
             st.session_state.presupuestos_items = temp_df
-        st.rerun() # Reinicia automático para actualizar los totales visuales abajo y en Tab 1
+        st.rerun()
 
     # --- SEMÁFORO DE LIQUIDEZ ---
     st.divider()
     st.subheader("🚦 Semáforo de Liquidez (Próximos 30 Días)")
-    st.markdown("Revisa el flujo de efectivo del próximo mes. Las **alertas rojas** indican un pago que se debe realizar antes de tu próximo ingreso.")
+    st.markdown("El sistema autogenera tus días de cobro semanales y mensuales para contrastarlos con tus pagos fijos programados.")
     
     hoy = date.today()
     eventos_radar = []
     cobro_detectado = False
     
+    # Mapeo de días de la semana para el cobro semanal
+    mapa_dias = {"Lunes": 0, "Martes": 1, "Miércoles": 2, "Jueves": 3, "Viernes": 4, "Sábado": 5, "Domingo": 6}
+    
     for i in range(31):
         dia_evaluar = hoy + timedelta(days=i)
         
-        # ¿Es día de cobro?
-        if dia_evaluar.day in st.session_state.dias_cobro:
-            eventos_radar.append({"Fecha": dia_evaluar, "Evento": "💰 DÍA DE PAGO", "Monto": "-", "Estado": "🟢 INGRESO"})
+        es_dia_cobro = False
+        # Validar cobro mensual fijo
+        if dia_evaluar.day in st.session_state.dias_cobro_mes:
+            es_dia_cobro = True
+        # Validar cobro semanal recurrente (ej. todos los sábados)
+        if st.session_state.dia_cobro_semanal != "Ninguno":
+            if dia_evaluar.weekday() == mapa_dias.get(st.session_state.dia_cobro_semanal, -1):
+                es_dia_cobro = True
+                
+        if es_dia_cobro:
+            eventos_radar.append({"Fecha": dia_evaluar, "Evento": "💰 DÍA DE COBRO", "Monto": "-", "Estado": "🟢 INGRESO"})
             cobro_detectado = True
             
-        # Revisar pagos obligatorios de ese día
+        # Revisar pagos obligatorios recurrentes de ese día del mes
         for item in items_vigentes:
             if item["Dia_Pago"] == dia_evaluar.day:
                 estado_alerta = "🟡 PRÓXIMO" if cobro_detectado or i < 3 else "🔴 ALERTA: SIN LIQUIDEZ PREVIA"
@@ -402,8 +419,7 @@ with tab_presupuestos:
                 if "🚨" in val: return 'background-color: #ffcccc; color: #cc0000; font-weight: bold'
                 if "🟡" in val: return 'background-color: #ffffe6; color: #b3b300; font-weight: bold'
             return ''
-        
-        # Usamos .map para ser compatibles con las nuevas versiones de Pandas en Streamlit
+            
         st.dataframe(df_radar.style.map(color_estados, subset=['Estado']), use_container_width=True, hide_index=True)
     else:
         st.info("No hay días de cobro ni pagos fijos programados en los próximos 30 días.")
